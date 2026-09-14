@@ -14,7 +14,7 @@ public class Discovery
 {
     // TODO
     public int PORT = 52388;
-    public async Task Start(string deviceID)
+    public async Task Start(string deviceID, int tcpPort)
     {
         UdpClient client = new UdpClient();
         client.EnableBroadcast = true;
@@ -41,6 +41,8 @@ public class Discovery
 
         await Task.WhenAll(sendTask, receiveTask);
     }
+
+    public event Action<string, IPAddress, int>? PeerDiscovered;
 
     private async Task Send(UdpClient client, string message)
     {
