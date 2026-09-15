@@ -25,7 +25,7 @@ public class Discovery
         {
             while (true)
             {
-                await Send(client, $"HELLO {deviceID}");
+                await Send(client, $"{tcpPort}:{deviceID}");
                 await Task.Delay(2000);
             }
         });
@@ -34,8 +34,15 @@ public class Discovery
         {
             while (true)
             {
-                string message = await Receive(client);
-                Console.WriteLine($"received: {message}");
+                var result = await Receive(client);
+                string message = result.message;
+                IPAddress sender = result.sender;
+                Console.WriteLine($"received: {message}"); //debug
+                string[] parts = message.Split(':');
+                int other_port = int.Parse(parts[0]);
+                string other_device_id = parts[1];
+
+                PeerDiscovered?.Invoke(other_device_id, sender, other_port);
             }
         });
 
@@ -50,13 +57,13 @@ public class Discovery
         await client.SendAsync(data, data.Length, new IPEndPoint(IPAddress.Broadcast, PORT));
     }
 
-    private async Task<string> Receive(UdpClient client)
+    private async Task<(string message, IPAddress sender)> Receive(UdpClient client)
     {
         while (true)
         {
             var result = await client.ReceiveAsync();
             string message = byteToStr(result.Buffer);
-            return message;
+            return (message, result.RemoteEndPoint.Address);
         }
     }
 

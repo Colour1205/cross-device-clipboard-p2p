@@ -4,7 +4,18 @@
 
 namespace ClipboardDaemon.Storage;
 
-public class HistoryStore
+public class HistoryAccess
 {
     // TODO
+    public getHistory()
+    {
+        
+    }
+    /*
+    merges history from peer into local history
+    */
+    public addToHistory(string content, string type = "text")
+    {
+        
+    }
 }

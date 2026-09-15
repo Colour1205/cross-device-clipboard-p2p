@@ -1,20 +1,20 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\Colour\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj": {}
+    "C:\\Users\\Colour3070\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj": {}
   },
   "projects": {
-    "C:\\Users\\Colour\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj": {
+    "C:\\Users\\Colour3070\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\Colour\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj",
+        "projectUniqueName": "C:\\Users\\Colour3070\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj",
         "projectName": "ClipboardDaemon",
-        "projectPath": "C:\\Users\\Colour\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj",
-        "packagesPath": "C:\\Users\\Colour\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\Colour\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\obj\\",
+        "projectPath": "C:\\Users\\Colour3070\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\ClipboardDaemon.csproj",
+        "packagesPath": "C:\\Users\\Colour3070\\.nuget\\packages\\",
+        "outputPath": "C:\\Users\\Colour3070\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\daemon\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
-          "C:\\Users\\Colour\\AppData\\Roaming\\NuGet\\NuGet.Config"
+          "C:\\Users\\Colour3070\\AppData\\Roaming\\NuGet\\NuGet.Config"
         ],
         "originalTargetFrameworks": [
           "net10.0-windows"

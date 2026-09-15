@@ -5,14 +5,17 @@
 
 namespace ClipboardDaemon.Clipboard;
 
-public class ClipboardWatcher
+using System.Collections.Concurrent;
+
+public class ClipboardSync
 {
+    BlockingCollection<(string content, string type)> _pendingSets = new BlockingCollection<(string content, string type)>();
     public event Action<string>? ClipboardChanged;
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     static extern uint GetClipboardSequenceNumber();
 
-    public void Start()
+    public void Watch()
     {
         long last_sequence_num = GetClipboardSequenceNumber();
         while (true)
@@ -36,7 +39,27 @@ public class ClipboardWatcher
                     Console.WriteLine($"non-text change: img={is_img} audio={is_aud} files={is_drop_lst}");
                 }
             }
+            // push content from the queue to the clipboard
+            if (_pendingSets.TryTake(out var pendingSet))
+                setContent(pendingSet.content, pendingSet.type);
             System.Threading.Thread.Sleep(500);
+        }
+    }
+
+    public void addToQueue(string content, string type = "text")
+    {
+        _pendingSets.Add((content, type));
+    }
+
+    public void setContent(String content, string type = "text")
+    {
+        if (type == "text")
+        {
+            System.Windows.Forms.Clipboard.SetText(content);
+        }
+        else
+        {
+            throw new NotImplementedException("Only text clipboard is supported for now.");
         }
     }
 }
