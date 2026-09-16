@@ -37,7 +37,6 @@ public class Discovery
                 var result = await Receive(client);
                 string message = result.message;
                 IPAddress sender = result.sender;
-                Console.WriteLine($"received: {message}"); //debug
                 string[] parts = message.Split(':');
                 int other_port = int.Parse(parts[0]);
                 string other_device_id = parts[1];

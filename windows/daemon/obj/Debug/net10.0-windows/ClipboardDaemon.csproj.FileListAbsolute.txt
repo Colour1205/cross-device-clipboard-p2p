@@ -21,3 +21,10 @@ C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows
 C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\obj\Debug\net10.0-windows\ClipboardDaemon.dll
 C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\obj\Debug\net10.0-windows\refint\ClipboardDaemon.dll
 C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\obj\Debug\net10.0-windows\ClipboardDaemon.pdb
+C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\bin\Debug\net10.0-windows\ClipboardDaemon.exe
+C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\bin\Debug\net10.0-windows\ClipboardDaemon.deps.json
+C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\bin\Debug\net10.0-windows\ClipboardDaemon.runtimeconfig.json
+C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\bin\Debug\net10.0-windows\ClipboardDaemon.dll
+C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\bin\Debug\net10.0-windows\ClipboardDaemon.pdb
+C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\obj\Debug\net10.0-windows\ClipboardDaemon.genruntimeconfig.cache
+C:\Users\Colour3070\OneDrive\Documents\GitHub\cross-device-clipboard-p2p\windows\daemon\obj\Debug\net10.0-windows\ref\ClipboardDaemon.dll

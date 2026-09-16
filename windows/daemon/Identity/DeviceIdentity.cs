@@ -27,7 +27,14 @@ public class DeviceIdentity
             File.WriteAllBytes(key_path, key.ExportPkcs8PrivateKey());
         }
     }
-    public string GetPublicKeyBase64(){
+    /*
+    return the base64 publickey
+    */
+    public string GetPublicKey(){
         return Convert.ToBase64String(key.ExportSubjectPublicKeyInfo());
+    }
+    public byte[] SignData(byte[] data)
+    {
+        return key.SignData(data, HashAlgorithmName.SHA256);
     }
 }

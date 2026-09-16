@@ -32,16 +32,13 @@ public class HistoryAccess
     merges history from peer into local history
     return True if operation succeeded, False otherwise
     */
-    public Boolean addToHistory(string content, string type, string deviceId, DateTime timestamp)
+    public Boolean addToHistory(ClipboardEntry entry)
     {
-        foreach (var entry in inMemoryHistory)
+        if (inMemoryHistory.Contains(entry))
         {
-            if (entry.Content == content && entry.Type == type && entry.DeviceId == deviceId && entry.Timestamp == timestamp)
-            {
-                return false; // duplicate entry
-            }
+            return false; // duplicate entry
         }
-        inMemoryHistory.Add(new ClipboardEntry(content, type, deviceId, timestamp));
+        inMemoryHistory.Add(entry);
         saveHistory();
         return true;
     }
