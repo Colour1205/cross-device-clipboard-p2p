@@ -20,6 +20,7 @@ class Program
         var identity = new DeviceIdentity(label);
         var historyAccess = new HistoryAccess(label);
         TrustStore trustStore = new TrustStore(label);
+        Console.WriteLine($"Device ID (public key): {identity.GetPublicKey()}");
 
         if (trustedKeyToAdd != null)
         {
