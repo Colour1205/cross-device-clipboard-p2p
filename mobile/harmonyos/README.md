@@ -36,11 +36,12 @@ before any real app-building starts.
 | Networking (UDP discovery, TCP peer link) | `System.Net.Sockets` | `@ohos.net.socket` — `constructUDPSocketInstance()` / `constructTCPSocketInstance()`. Requires `ohos.permission.INTERNET` declared in `module.json5`. |
 | Background sync | N/A (always-on daemon) | **Foreground-only**, per the original architecture decision — HarmonyOS's background task model (Transient/Continuous/Deferred, none suited to "run indefinitely like a daemon") confirms that decision still holds for API 26. Sync happens on app open/foreground only. |
 
-## Genuine unknowns — to resolve in the spike, not guess at
+## Genuine unknowns — resolved via the spike (2026-09-18/19)
 
-- **LAN broadcast/multicast permission specifics** weren't clearly confirmed in research — general `INTERNET` permission is documented, but nothing specific to broadcast/multicast beyond that surfaced. Needs hands-on verification; if HarmonyOS restricts this further than expected, discovery may need to fall back to Tailscale-address-only or manual QR pairing *specifically* on this platform (same kind of per-platform tradeoff already made for image/file sync support).
-- **HUKS-signed output format compatibility** with .NET's ECDSA signature encoding (both should be raw P-256, but this needs an actual test, not an assumption).
-- **PBKDF2 output compatibility** — needs a known-input/known-output test vector compared against the C# implementation before trusting it.
+- ~~**HUKS-signed output format compatibility**~~ — RESOLVED: **DER/ASN.1-encoded** (measured 70/71/72 bytes across runs, always starting `0x30` — the small length variance is normal DER, depending on whether `r`/`s` need a leading zero byte). **Not** raw r‖s like .NET's `ECDsa.SignData`/`VerifyData` default. A DER↔raw conversion step is required wherever a HUKS-produced signature needs to interop with the Windows daemon (or vice versa) — needs implementing before step 7 (signing/verification).
+- ~~**PBKDF2 output compatibility**~~ — RESOLVED, but not the way expected: `cryptoFramework.createKdf('PBKDF2|SHA256').generateSecret()` **fails on-device** with `code 401, message: "build context fail"`, reproducibly, regardless of iteration count (tried 210,000 and 1), `algName` literal (`'PBKDF2Spec'` and `'Pbkdf2ParamsSpec'`), or `password` type (`Uint8Array` and `string`). Device confirmed at `OpenHarmony-7.0.0.105`, `sdkApiVersion 26` — exactly matches the SDK, so it's not a version mismatch. `cryptoFramework`'s HMAC-SHA256 path was verified working and byte-exact against .NET's `HMACSHA256` in isolation, which narrows this to a genuine gap in this Beta OS build's native PBKDF2 implementation specifically, not a parameter-shape bug or a broader crypto framework problem.
+  **Workaround (implemented and verified correct)**: PBKDF2-HMAC-SHA256 built manually on top of the working HMAC primitive (standard construction: `T_i = U_1 xor U_2 xor ... xor U_c`, `U_1 = HMAC(P, S‖INT32BE(i))`, `U_j = HMAC(P, U_{j-1})`). Verified byte-exact against a .NET reference at both 1,000 and 210,000 iterations. This is what the real app should use for the identity/passphrase KDF — not the built-in `Kdf.generateSecret`. Worth re-testing the built-in path against a future OS update in case it gets fixed, but don't block on it.
+- **LAN broadcast/multicast permission specifics** — still unverified, deferred to step 5 (networking) since it needs actual socket code to test, not just crypto.
 
 ## Environment setup
 
@@ -51,11 +52,13 @@ before any real app-building starts.
 ## Build order
 
 1. ~~**Environment + hello-world**~~ — done (2026-09-17). DevEco Studio 26 installed, Empty Ability project created under `entry/`, blank ArkTS app confirmed running on a real device.
-2. **Protocol compatibility spike** (before any real app structure) — in progress. `entry/src/main/ets/pages/Index.ets` currently holds the spike harness (not a real app screen yet — it replaces the default hello-world page temporarily), with two on-device tests:
-   - **PBKDF2-SHA256**: derives a key from a fixed passphrase/salt using `cryptoFramework`, compares against a reference hex value computed via `dotnet run` on the actual .NET crypto APIs `PassphraseAuth.cs` uses. Pass/fail is exact-match, shown on screen.
-   - **HUKS ECDSA P-256 signing**: generates a key via HUKS, signs a fixed string, and reports the raw signature length/bytes. The open question flagged below (raw r||s vs DER) gets answered here by inspection — 64 bytes = raw (matches .NET directly), other length starting with `0x30` = DER (needs a conversion step before it'll interop with `ECDsa.VerifyData`).
+2. ~~**Protocol compatibility spike**~~ — done (2026-09-19). `entry/src/main/ets/pages/Index.ets` holds the spike harness (still not a real app screen — replaces the default hello-world page temporarily; will be replaced for real in step 3). Four on-device tests, all resolved — see "Genuine unknowns" above for the detailed findings:
+   1. **PBKDF2-SHA256 via built-in `Kdf`** — fails on-device (platform bug, not our bug).
+   2. **HUKS ECDSA P-256 signing** — works, but DER-encoded, not raw r‖s.
+   3. **HMAC-SHA256 baseline** — works, byte-exact vs .NET.
+   4. **Manual PBKDF2-via-HMAC workaround** — works, byte-exact vs .NET at both 1,000 and 210,000 iterations.
 
-   Run it on the real device and report back the two on-screen results (or errors) — that determines whether HUKS can be used as-is for the identity key or needs a DER→raw signature adapter.
+   Carry forward into later steps: `pbkdf2Sha256Manual()` (test 4) for the real passphrase-derived key in step 4, and a DER↔raw signature converter (needed before step 7) for HUKS-signed data to interop with `ECDsa`.
 3. **Clipboard read + watch** — `@ohos.pasteboard`, content-hash-based echo suppression (no sequence-number equivalent here).
 4. **Local persistence** — identity in HUKS, trust store + passphrase key reference in Preferences, file blobs in `@ohos.file.fs`.
 5. **Networking** — UDP discovery (send/receive, matching the exact beacon format), then TCP connect.
