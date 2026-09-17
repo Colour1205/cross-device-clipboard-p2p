@@ -19,12 +19,18 @@ public class DeviceIdentity
         Directory.CreateDirectory(Path.Combine(app_data_dir, "ClipboardDaemon"));
         if (File.Exists(key_path))
         {
-            key.ImportPkcs8PrivateKey(File.ReadAllBytes(key_path), out _);
+            byte[] protectedBytes = File.ReadAllBytes(key_path);
+            byte[] pkcs8Bytes = System.Security.Cryptography.ProtectedData.Unprotect(protectedBytes, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+            key.ImportPkcs8PrivateKey(pkcs8Bytes, out _);
         }
         else
         {
             key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-            File.WriteAllBytes(key_path, key.ExportPkcs8PrivateKey());
+            byte[] pkcs8Bytes = key.ExportPkcs8PrivateKey();
+            // DPAPI-encrypted at rest, tied to this Windows user — a copied file
+            // is useless to anyone who isn't logged in as this same user on this machine.
+            byte[] protectedBytes = System.Security.Cryptography.ProtectedData.Protect(pkcs8Bytes, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+            File.WriteAllBytes(key_path, protectedBytes);
         }
     }
     /*

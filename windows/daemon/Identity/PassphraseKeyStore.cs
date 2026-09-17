@@ -18,7 +18,8 @@ public class PassphraseKeyStore
 
         if (File.Exists(key_path))
         {
-            key = File.ReadAllBytes(key_path);
+            byte[] protectedBytes = File.ReadAllBytes(key_path);
+            key = System.Security.Cryptography.ProtectedData.Unprotect(protectedBytes, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
         }
     }
 
@@ -36,6 +37,9 @@ public class PassphraseKeyStore
     public void SetPassphrase(string passphrase)
     {
         key = PassphraseAuth.DeriveKey(passphrase, FixedSalt);
-        File.WriteAllBytes(key_path, key);
+        // DPAPI-encrypted at rest, tied to this Windows user — see DeviceIdentity
+        // for the same treatment of the identity private key.
+        byte[] protectedBytes = System.Security.Cryptography.ProtectedData.Protect(key, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+        File.WriteAllBytes(key_path, protectedBytes);
     }
 }

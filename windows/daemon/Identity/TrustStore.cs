@@ -50,6 +50,12 @@ public class TrustStore
         return trustedDevices.Values.Where(d => !string.IsNullOrWhiteSpace(d.Address));
     }
 
+    // Every trusted device, address or not — for a "manage devices" UI.
+    public IEnumerable<TrustedDevice> GetAllTrustedDevices()
+    {
+        return trustedDevices.Values;
+    }
+
     public void saveTrustStore()
     {
         string json = System.Text.Json.JsonSerializer.Serialize(trustedDevices.Values.ToList());

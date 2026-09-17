@@ -1,0 +1,22 @@
+# Build output
+bin/
+obj/
+
+# VS / VS Code
+.vs/
+*.user
+*.suo
+
+# Rider
+.idea/
+
+# OS junk
+Thumbs.db
+.DS_Store
+
+# NuGet
+*.nupkg
+**/packages/*
+
+# Logs and scratch files created while testing this project locally
+*.log

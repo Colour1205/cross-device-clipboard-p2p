@@ -7,8 +7,15 @@ namespace ClipboardDaemon.Clipboard;
 
 using System.Collections.Concurrent;
 
+// What Content holds for type == "file": the original name, plus the raw
+// file bytes, base64-encoded — same "Content is just a string, meaning
+// depends on Type" pattern as everything else, no ClipboardEntry changes needed.
+public record FilePayload(string FileName, string DataBase64);
+
 public class ClipboardSync
 {
+    private const long MaxFileBytes = 1024L * 1024 * 1024; // 1GB — our transport buffers a whole file in memory at once (no chunked streaming), so this is a real memory ceiling, not just a network one
+
     BlockingCollection<(string content, string type)> _pendingSets = new BlockingCollection<(string content, string type)>();
     private string? _lastKnownHash;
     public event Action<(string content, string type)>? ClipboardChanged;
@@ -64,13 +71,40 @@ public class ClipboardSync
                             ClipboardChanged?.Invoke((System.Windows.Forms.Clipboard.GetText(), "text"));
                         }
                     }
+                    else if (is_drop_lst)
+                    {
+                        var files = System.Windows.Forms.Clipboard.GetFileDropList();
+                        // v1 scope: single file only — first entry, rest ignored
+                        if (files.Count > 0 && files[0] != null)
+                        {
+                            string path = files[0]!;
+                            var fileInfo = new FileInfo(path);
+                            if (!fileInfo.Exists)
+                            {
+                                Console.WriteLine($"skipping file drop, not a readable file: {path}");
+                            }
+                            else if (fileInfo.Length > MaxFileBytes)
+                            {
+                                Console.WriteLine($"skipping file drop, too large to sync ({fileInfo.Length} bytes, limit {MaxFileBytes}): {path}");
+                            }
+                            else
+                            {
+                                byte[] fileBytes = File.ReadAllBytes(path);
+                                string hash = ComputeHash(fileBytes);
+                                if (hash != _lastKnownHash)
+                                {
+                                    _lastKnownHash = hash;
+                                    var payload = new FilePayload(fileInfo.Name, Convert.ToBase64String(fileBytes));
+                                    ClipboardChanged?.Invoke((System.Text.Json.JsonSerializer.Serialize(payload), "file"));
+                                }
+                            }
+                        }
+                    }
                     else
                     {
-                        // Audio and file-drop entries aren't synced: a local file path
-                        // (e.g. C:\Users\...) is meaningless on another device without a
-                        // real file-transfer feature, which doesn't exist yet. Skip rather
-                        // than half-implement something that would silently do nothing useful.
-                        Console.WriteLine($"unsupported clipboard change: audio={is_aud} files={is_drop_lst}");
+                        // Audio has no meaningful cross-device representation the same
+                        // way files/images do — skip rather than half-implement it.
+                        Console.WriteLine($"unsupported clipboard change: audio={is_aud}");
                     }
                 } catch (Exception)
                 {
@@ -112,6 +146,26 @@ public class ClipboardSync
             using var image = System.Drawing.Image.FromStream(ms);
             System.Windows.Forms.Clipboard.SetImage(image);
         }
+        else if (type == "file")
+        {
+            var payload = System.Text.Json.JsonSerializer.Deserialize<FilePayload>(content);
+            if (payload == null) return;
+
+            byte[] fileBytes = Convert.FromBase64String(payload.DataBase64);
+            _lastKnownHash = ComputeHash(fileBytes);
+
+            string receivedDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "ClipboardDaemon", "ReceivedFiles");
+            Directory.CreateDirectory(receivedDir);
+
+            string destPath = GetNonCollidingPath(receivedDir, payload.FileName);
+            File.WriteAllBytes(destPath, fileBytes);
+
+            var fileList = new System.Collections.Specialized.StringCollection();
+            fileList.Add(destPath);
+            System.Windows.Forms.Clipboard.SetFileDropList(fileList);
+        }
         else
         {
             throw new NotImplementedException($"Clipboard type '{type}' is not supported yet.");
@@ -122,4 +176,22 @@ public class ClipboardSync
 {
     return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(data));
 }
+
+    // If "photo.jpg" already exists, try "photo (1).jpg", "photo (2).jpg", etc.
+    private string GetNonCollidingPath(string dir, string fileName)
+    {
+        string candidate = Path.Combine(dir, fileName);
+        if (!File.Exists(candidate)) return candidate;
+
+        string nameOnly = Path.GetFileNameWithoutExtension(fileName);
+        string ext = Path.GetExtension(fileName);
+        int counter = 1;
+        do
+        {
+            candidate = Path.Combine(dir, $"{nameOnly} ({counter}){ext}");
+            counter++;
+        } while (File.Exists(candidate));
+
+        return candidate;
+    }
 }

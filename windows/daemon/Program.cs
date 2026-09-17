@@ -12,9 +12,6 @@ class Program
 {
     private static void HandleMessage(
         string msg,
-        ref string? other_device_id,
-        PeerConnection conn,
-        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
         ClipboardSync clipboardSync,
         HistoryAccess historyAccess,
         TrustStore trustStore)
@@ -39,11 +36,6 @@ class Program
                 Console.WriteLine("Received message with invalid signature from peer.");
                 return;
             }
-            // an "entry" message is always self-originated by the sender, so this is
-            // the one place it's actually safe to learn who this connection belongs to
-            other_device_id = entry.DeviceId;
-            connectionsByDeviceId[entry.DeviceId] = conn;
-
             clipboardSync.addToQueue(entry.Content, entry.Type);
             historyAccess.addToHistory(entry);
         }
@@ -62,9 +54,6 @@ class Program
                     Console.WriteLine("Received message with invalid signature from peer.");
                     continue; // skip just this bad entry, keep processing the rest of the batch
                 }
-                // NOTE: deliberately NOT setting other_device_id here — a batch entry can
-                // have originated from a different device than the one we're connected to
-                // (history accumulates entries relayed from across the whole mesh).
                 if (historyAccess.addToHistory(entry)) // true only if genuinely new, not a duplicate
                 {
                     clipboardSync.addToQueue(entry.Content, entry.Type);
@@ -93,6 +82,7 @@ class Program
         string peerDeviceId,
         string address,
         int port,
+        DeviceIdentity myIdentity,
         ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
         ClipboardSync clipboardSync,
         HistoryAccess historyAccess,
@@ -101,22 +91,27 @@ class Program
     {
         TcpClient client = new TcpClient();
         await client.ConnectAsync(address, port, cancellationToken);
-        var conn = new PeerConnection(client);
-        string? connectedDeviceId = peerDeviceId;
-        connectionsByDeviceId[peerDeviceId] = conn;
 
+        var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore);
+        if (conn == null)
+        {
+            client.Close();
+            throw new IOException("Handshake failed, or peer is not trusted");
+        }
+        if (conn.PeerDeviceId != peerDeviceId)
+        {
+            // connected, but whoever answered isn't who we meant to reach —
+            // refuse rather than silently trusting data from the wrong device
+            conn.Close();
+            throw new IOException("Connected peer's identity did not match the expected device id");
+        }
+
+        connectionsByDeviceId[peerDeviceId] = conn;
         SendHistoryBatch(conn, historyAccess);
 
-        conn.MessageReceived += msg =>
-        {
-            HandleMessage(msg, ref connectedDeviceId, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
-        };
+        conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore);
+        conn.Disconnected += () => connectionsByDeviceId.TryRemove(peerDeviceId, out _);
         _ = conn.Listen();
-
-        conn.Disconnected += () =>
-        {
-            connectionsByDeviceId.TryRemove(peerDeviceId, out _);
-        };
     }
     [STAThread]
     static async Task Main(String[] args)
@@ -135,6 +130,10 @@ class Program
         {
             trustStore.Trust(trustedKeyToAdd);
         }
+
+        TrayLauncher.TryStart(label);
+
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId = new ConcurrentDictionary<string, PeerConnection>();
 
         // local IPC for the tray app (QR pairing, passcode setup, etc.)
         var ipcServer = new IpcServer(label);
@@ -179,14 +178,29 @@ class Program
                 }
                 return new IpcResponse(true, "trusted");
             }
+            else if (request.Command == "list_connections")
+            {
+                return new IpcResponse(true, JsonSerializer.Serialize(connectionsByDeviceId.Keys.ToList()));
+            }
+            else if (request.Command == "list_trusted")
+            {
+                return new IpcResponse(true, JsonSerializer.Serialize(trustStore.GetAllTrustedDevices().ToList()));
+            }
+            else if (request.Command == "untrust_device" && request.Payload != null)
+            {
+                trustStore.Untrust(request.Payload);
+                if (connectionsByDeviceId.TryRemove(request.Payload, out var conn))
+                {
+                    conn.Close();
+                }
+                return new IpcResponse(true, "untrusted");
+            }
             else
             {
                 return new IpcResponse(false, "unknown command");
             }
         };
         _ = Task.Run(() => ipcServer.Start());
-
-        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId = new ConcurrentDictionary<string, PeerConnection>();
 
         // clipboard watcher
         var clipboardSync = new ClipboardSync();
@@ -224,24 +238,21 @@ class Program
             while (true)
             {
                 var client = await tcpListener.AcceptTcpClientAsync();
-                var conn = new PeerConnection(client); // wrap each connection in a PeerConnection object
 
-                // send history batch on connection
+                var conn = await PeerConnection.CreateAsync(client, identity, trustStore);
+                if (conn == null)
+                {
+                    // handshake failed, or whoever connected isn't in our trust
+                    // store — refuse at the connection level, not just per-message
+                    client.Close();
+                    continue;
+                }
+
+                connectionsByDeviceId[conn.PeerDeviceId] = conn;
                 SendHistoryBatch(conn, historyAccess);
-                
-                string? other_device_id = null;
-                conn.MessageReceived += msg =>
-                {
-                    HandleMessage(msg, ref other_device_id, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
-                };
 
-                conn.Disconnected += () =>
-                {
-                    if (other_device_id != null)
-                    {
-                        connectionsByDeviceId.TryRemove(other_device_id, out _);
-                    }
-                };
+                conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore);
+                conn.Disconnected += () => connectionsByDeviceId.TryRemove(conn.PeerDeviceId, out _);
                 _ = conn.Listen();
             }
 
@@ -275,7 +286,7 @@ class Program
                 Console.WriteLine($"Discovered peer {other_device_id} at {other_port}");
                 try
                 {
-                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
+                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
                 }
                 catch (Exception)
                 {
@@ -300,7 +311,7 @@ class Program
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                         try
                         {
-                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), connectionsByDeviceId, clipboardSync, historyAccess, trustStore, cts.Token);
+                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, cts.Token);
                         }
                         catch (Exception)
                         {
