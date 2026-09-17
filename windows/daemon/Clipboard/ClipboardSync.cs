@@ -19,9 +19,12 @@ public class ClipboardSync
     public void Watch()
     {
         long last_sequence_num = GetClipboardSequenceNumber();
-        while (true)
+
+        var timer = new System.Windows.Forms.Timer();
+        timer.Interval = 500;
+        timer.Tick += (s, e) =>
         {
-            long curr_sequence_num = GetClipboardSequenceNumber();
+                        long curr_sequence_num = GetClipboardSequenceNumber();
             if (curr_sequence_num != last_sequence_num)
             {
                 try{
@@ -61,8 +64,10 @@ public class ClipboardSync
             {
                 Console.WriteLine($"clipboard busy, dropping this peer update for now");
             }
-            System.Threading.Thread.Sleep(500);
-        }
+        };
+
+        timer.Start();
+        System.Windows.Forms.Application.Run();
     }
 
     public void addToQueue(string content, string type = "text")
