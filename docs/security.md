@@ -23,3 +23,26 @@ Devices must be explicitly paired before they trust each other's clipboard data.
 - LAN-local attacker should not be able to join the mesh without completing pairing.
 - A compromised/unpaired device should not be able to read or inject clipboard entries.
 - Lost/stolen device: needs a way to revoke its trust from the others (unpair) — TBD.
+
+## Windows daemon security review (2026-09-18)
+
+Self-review of the implemented Windows daemon, thinking as an attacker. Ordered by severity; none of these are fixed yet.
+
+### Critical
+1. **Local IPC has no authentication.** `IpcServer` opens a named pipe (`ClipboardDaemonIPC_<label>`) with a fully predictable name and no ACL/secret. Any process running as the same Windows user can connect and issue `trust_device`, `set_passphrase`, `untrust_device`, `list_trusted`/`list_connections` — full control of the daemon, completely bypassing every network-level protection (ECDH, signing, trust checks). This is the top priority fix.
+2. **Handshake has no timeout — one connection can freeze the whole daemon.** The accept loop `await`s `PeerConnection.CreateAsync` before looping back to accept the next connection. A peer that opens a TCP connection and never sends handshake data blocks the daemon from accepting *any* other connection (including legitimate devices) until the OS-level socket timeout eventually fires (can be minutes).
+
+### High
+3. **No size limit on any line read from the network** (handshake, envelope, chunk) — `ReadLineAsync()` will buffer an attacker-supplied line of unbounded length, a memory-exhaustion vector.
+4. **Abandoned file transfers are never cleaned up.** `HandleFileChunk` opens a `FileStream` per hash with no timeout or cap on concurrent transfers; sending `file_chunk` messages for bogus hashes and never sending `IsLast` leaks file handles and disk space indefinitely.
+5. **Passphrase auto-trust proof is broadcast in cleartext**, enabling offline brute-force of a weak user-chosen passphrase by anyone who passively captures one beacon (no live throttling applies to an offline attack).
+
+### Medium
+6. **Trust revocation doesn't propagate.** `Untrust` only edits the local trust store — revoking a stolen device on one of your devices leaves it fully trusted on every other device until each is separately revoked.
+7. **Old signed entries can be replayed once evicted from the 25-item history cap** — dedup only checks "is this still in my current history," with no timestamp-freshness requirement.
+8. **`TrustStore`'s file isn't DPAPI-protected**, unlike the identity and passphrase keys — plain JSON revealing paired devices + their Tailscale addresses to anyone with local file access.
+
+### Low
+- No re-keying on long-lived connections (one compromised session key exposes that connection's whole lifetime of traffic).
+- Beacon spoofing (fake deviceId + port) can't achieve impersonation (the identity-signed handshake blocks it) but can cause wasted/nuisance connection attempts against a victim's real address.
+- `TrayLauncher`/`DaemonLauncher`'s path-guessing is fine for the current same-user dev layout but needs hardening before ever being installed to a shared location.
