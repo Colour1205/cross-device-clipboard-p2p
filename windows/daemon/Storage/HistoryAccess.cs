@@ -6,18 +6,31 @@ namespace ClipboardDaemon.Storage;
 
 public class HistoryAccess
 {
+    private const int MaxHistoryItems = 25;
+
     private List<ClipboardEntry> inMemoryHistory = new List<ClipboardEntry>();
     private string history_path;
-    public HistoryAccess(string label)
+    private readonly FileStore fileStore;
+
+    public HistoryAccess(string label, FileStore fileStore)
     {
+        this.fileStore = fileStore;
         // build clipboard entry from file
         string app_data_dir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         history_path = Path.Combine(app_data_dir, "ClipboardDaemon", $"history{label}.json");
         Directory.CreateDirectory(Path.Combine(app_data_dir, "ClipboardDaemon"));
         if (File.Exists(history_path))
         {
-            string json = File.ReadAllText(history_path);
-            inMemoryHistory = System.Text.Json.JsonSerializer.Deserialize<List<ClipboardEntry>>(json) ?? new List<ClipboardEntry>();
+            try
+            {
+                string json = File.ReadAllText(history_path);
+                inMemoryHistory = System.Text.Json.JsonSerializer.Deserialize<List<ClipboardEntry>>(json) ?? new List<ClipboardEntry>();
+            }
+            catch (System.Text.Json.JsonException ex)
+            {
+                Console.WriteLine($"Could not load history ({ex.Message}) — starting with empty history.");
+                inMemoryHistory = new List<ClipboardEntry>();
+            }
         }
         else
         {
@@ -39,9 +52,39 @@ public class HistoryAccess
             return false; // duplicate entry
         }
         inMemoryHistory.Add(entry);
+        TrimToLimit();
         saveHistory();
         return true;
     }
+
+    // Oldest-first eviction once we're over the cap. For a file entry, this
+    // also deletes its backing blob from FileStore — otherwise disk usage
+    // would grow forever even though the history record itself is capped.
+    private void TrimToLimit()
+    {
+        while (inMemoryHistory.Count > MaxHistoryItems)
+        {
+            var oldest = inMemoryHistory.OrderBy(e => e.Timestamp).First();
+            inMemoryHistory.Remove(oldest);
+
+            if (oldest.Type == "file")
+            {
+                try
+                {
+                    var payload = System.Text.Json.JsonSerializer.Deserialize<FilePayload>(oldest.Content);
+                    if (payload != null)
+                    {
+                        fileStore.Delete(payload.FileHash);
+                    }
+                }
+                catch (System.Text.Json.JsonException)
+                {
+                    // malformed descriptor — nothing coherent to clean up, just drop the record
+                }
+            }
+        }
+    }
+
     public Boolean saveHistory()
     {
         string json = System.Text.Json.JsonSerializer.Serialize(inMemoryHistory);

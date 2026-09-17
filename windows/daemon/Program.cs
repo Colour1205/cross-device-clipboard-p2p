@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using ClipboardDaemon.Identity;
 using ClipboardDaemon.Networking;
 using ClipboardDaemon.Clipboard;
@@ -10,11 +11,23 @@ using ClipboardDaemon.Crypto;
 
 class Program
 {
+    // Bundles the two pieces of state a chunked file transfer needs while
+    // it's in progress: the still-open write stream for each hash currently
+    // being received, and any entry that arrived (and was verified) before
+    // its bytes finished streaming in, waiting to be applied once they do.
+    private class FileTransferState
+    {
+        public ConcurrentDictionary<string, FileStream> InProgressWrites = new();
+        public ConcurrentDictionary<string, ClipboardEntry> PendingEntries = new();
+    }
+
     private static void HandleMessage(
         string msg,
         ClipboardSync clipboardSync,
         HistoryAccess historyAccess,
-        TrustStore trustStore)
+        TrustStore trustStore,
+        FileStore fileStore,
+        FileTransferState fileTransferState)
     {
         var envelope = JsonSerializer.Deserialize<Envelope>(msg);
         if (envelope == null)
@@ -36,7 +49,15 @@ class Program
                 Console.WriteLine("Received message with invalid signature from peer.");
                 return;
             }
-            clipboardSync.addToQueue(entry.Content, entry.Type);
+
+            if (entry.Type == "file")
+            {
+                HandleIncomingFileEntry(entry, clipboardSync, fileStore, fileTransferState);
+            }
+            else
+            {
+                clipboardSync.addToQueue(entry.Content, entry.Type);
+            }
             historyAccess.addToHistory(entry);
         }
         else if (envelope.Type == "history_batch")
@@ -56,14 +77,159 @@ class Program
                 }
                 if (historyAccess.addToHistory(entry)) // true only if genuinely new, not a duplicate
                 {
-                    clipboardSync.addToQueue(entry.Content, entry.Type);
+                    // Reconciliation only carries the small descriptor for file
+                    // entries, never the bytes (re-streaming a whole mesh's worth
+                    // of file history on every reconnect isn't attempted here) —
+                    // so only apply immediately if we already happen to have this
+                    // exact content cached locally.
+                    if (entry.Type == "file")
+                    {
+                        HandleIncomingFileEntry(entry, clipboardSync, fileStore, fileTransferState, onlyIfAlreadyCached: true);
+                    }
+                    else
+                    {
+                        clipboardSync.addToQueue(entry.Content, entry.Type);
+                    }
                 }
             }
+        }
+        else if (envelope.Type == "file_chunk")
+        {
+            HandleFileChunk(envelope.Payload, fileStore, fileTransferState, clipboardSync);
         }
         else
         {
             Console.WriteLine("Received message with unknown type from peer.");
             return;
+        }
+    }
+
+    private static void HandleIncomingFileEntry(
+        ClipboardEntry entry,
+        ClipboardSync clipboardSync,
+        FileStore fileStore,
+        FileTransferState fileTransferState,
+        bool onlyIfAlreadyCached = false)
+    {
+        FilePayload? payload;
+        try
+        {
+            payload = JsonSerializer.Deserialize<FilePayload>(entry.Content);
+        }
+        catch (JsonException) { payload = null; }
+
+        if (payload == null)
+        {
+            Console.WriteLine("Received malformed file entry from peer.");
+            return;
+        }
+
+        if (fileStore.Exists(payload.FileHash))
+        {
+            // already have these exact bytes locally — apply right away
+            clipboardSync.addToQueue(entry.Content, entry.Type);
+        }
+        else if (!onlyIfAlreadyCached)
+        {
+            // don't have it yet — remember to apply it once file_chunk messages
+            // for this hash finish arriving and verify
+            fileTransferState.PendingEntries[payload.FileHash] = entry;
+        }
+    }
+
+    private static void HandleFileChunk(
+        string payloadJson,
+        FileStore fileStore,
+        FileTransferState fileTransferState,
+        ClipboardSync clipboardSync)
+    {
+        FileChunkMessage? chunk;
+        try
+        {
+            chunk = JsonSerializer.Deserialize<FileChunkMessage>(payloadJson);
+        }
+        catch (JsonException) { chunk = null; }
+        if (chunk == null) return;
+
+        byte[] chunkBytes;
+        try
+        {
+            chunkBytes = Convert.FromBase64String(chunk.DataBase64);
+        }
+        catch (FormatException) { return; }
+
+        var stream = fileTransferState.InProgressWrites.GetOrAdd(chunk.FileHash, _ =>
+            new FileStream(fileStore.GetTempPath(chunk.FileHash), FileMode.Create, FileAccess.Write));
+
+        try
+        {
+            stream.Write(chunkBytes, 0, chunkBytes.Length);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed writing file chunk ({ex.Message}) — abandoning this transfer.");
+            fileTransferState.InProgressWrites.TryRemove(chunk.FileHash, out _);
+            stream.Dispose();
+            return;
+        }
+
+        if (!chunk.IsLast) return;
+
+        stream.Flush();
+        stream.Dispose();
+        fileTransferState.InProgressWrites.TryRemove(chunk.FileHash, out _);
+
+        string tempPath = fileStore.GetTempPath(chunk.FileHash);
+        string actualHash;
+        using (var verifyStream = File.OpenRead(tempPath))
+        {
+            actualHash = Convert.ToHexString(SHA256.HashData(verifyStream));
+        }
+
+        if (actualHash != chunk.FileHash)
+        {
+            // corrupted in transit, or tampered — the signed entry's hash is
+            // what we trust, not whatever bytes actually showed up
+            Console.WriteLine($"File transfer failed hash verification (expected {chunk.FileHash}, got {actualHash}) — discarding.");
+            File.Delete(tempPath);
+            fileTransferState.PendingEntries.TryRemove(chunk.FileHash, out _);
+            return;
+        }
+
+        File.Move(tempPath, fileStore.GetPath(chunk.FileHash), overwrite: true);
+
+        if (fileTransferState.PendingEntries.TryRemove(chunk.FileHash, out var pendingEntry))
+        {
+            clipboardSync.addToQueue(pendingEntry.Content, pendingEntry.Type);
+        }
+    }
+
+    // Reads a file incrementally and sends it as a sequence of file_chunk
+    // envelopes — bounded memory (one chunk at a time) regardless of the
+    // file's total size, unlike embedding the whole thing in one message.
+    private static async Task StreamFileToPeer(PeerConnection conn, string filePath, string fileHash)
+    {
+        const int chunkSize = 256 * 1024;
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            byte[] buffer = new byte[chunkSize];
+            int chunkIndex = 0;
+            int bytesRead;
+            while ((bytesRead = await stream.ReadAsync(buffer, 0, chunkSize)) > 0)
+            {
+                bool isLast = stream.Position >= stream.Length;
+                byte[] chunkBytes = bytesRead == chunkSize ? buffer : buffer[..bytesRead];
+                var chunkMsg = new FileChunkMessage(fileHash, chunkIndex, isLast, Convert.ToBase64String(chunkBytes));
+                var envelope = new Envelope("file_chunk", JsonSerializer.Serialize(chunkMsg));
+                await conn.Send(JsonSerializer.Serialize(envelope));
+                chunkIndex++;
+            }
+        }
+        catch (Exception)
+        {
+            // peer disconnected mid-transfer, or the source file became
+            // unreadable — nothing further to do about it
         }
     }
 
@@ -87,6 +253,8 @@ class Program
         ClipboardSync clipboardSync,
         HistoryAccess historyAccess,
         TrustStore trustStore,
+        FileStore fileStore,
+        FileTransferState fileTransferState,
         CancellationToken cancellationToken = default)
     {
         TcpClient client = new TcpClient();
@@ -109,7 +277,7 @@ class Program
         connectionsByDeviceId[peerDeviceId] = conn;
         SendHistoryBatch(conn, historyAccess);
 
-        conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore);
+        conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
         conn.Disconnected += () => connectionsByDeviceId.TryRemove(peerDeviceId, out _);
         _ = conn.Listen();
     }
@@ -121,9 +289,11 @@ class Program
         string? trustedKeyToAdd = args.Length > 2 ? args[2] : null;
 
         var identity = new DeviceIdentity(label);
-        var historyAccess = new HistoryAccess(label);
+        var fileStore = new FileStore(label);
+        var historyAccess = new HistoryAccess(label, fileStore);
         TrustStore trustStore = new TrustStore(label);
         var passphraseKeyStore = new PassphraseKeyStore(label);
+        var fileTransferState = new FileTransferState();
         Console.WriteLine($"Device ID (public key): {identity.GetPublicKey()}");
 
         if (trustedKeyToAdd != null)
@@ -132,6 +302,11 @@ class Program
         }
 
         TrayLauncher.TryStart(label);
+
+        // computed once — Tailscale IPs are stable, and shelling out to the CLI
+        // on every 2-second beacon would be wasteful. If Tailscale gets installed
+        // while the daemon is already running, a restart picks it up.
+        string? ownTailscaleAddress = TailscaleHelper.GetOwnTailscaleIp();
 
         ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId = new ConcurrentDictionary<string, PeerConnection>();
 
@@ -203,7 +378,7 @@ class Program
         _ = Task.Run(() => ipcServer.Start());
 
         // clipboard watcher
-        var clipboardSync = new ClipboardSync();
+        var clipboardSync = new ClipboardSync(fileStore);
         clipboardSync.ClipboardChanged += content =>
         {
             var entry = new ClipboardEntry(content.content, content.type, identity.GetPublicKey(), DateTime.UtcNow);
@@ -215,6 +390,35 @@ class Program
                 _ = conn.Send(json);
             }
             historyAccess.addToHistory(signedEntry);
+
+            if (content.type == "file" && content.sourceFilePath != null)
+            {
+                FilePayload? payload = null;
+                try { payload = JsonSerializer.Deserialize<FilePayload>(content.content); }
+                catch (JsonException) { }
+
+                if (payload != null)
+                {
+                    if (!fileStore.Exists(payload.FileHash))
+                    {
+                        try
+                        {
+                            File.Copy(content.sourceFilePath, fileStore.GetPath(payload.FileHash), overwrite: true);
+                        }
+                        catch (IOException ex)
+                        {
+                            Console.WriteLine($"Could not cache file locally ({ex.Message}) — won't be able to stream it to peers.");
+                        }
+                    }
+                    if (fileStore.Exists(payload.FileHash))
+                    {
+                        foreach (var conn in connectionsByDeviceId.Values)
+                        {
+                            _ = StreamFileToPeer(conn, fileStore.GetPath(payload.FileHash), payload.FileHash);
+                        }
+                    }
+                }
+            }
         };
 #pragma warning disable CS4014
 
@@ -251,7 +455,7 @@ class Program
                 connectionsByDeviceId[conn.PeerDeviceId] = conn;
                 SendHistoryBatch(conn, historyAccess);
 
-                conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore);
+                conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
                 conn.Disconnected += () => connectionsByDeviceId.TryRemove(conn.PeerDeviceId, out _);
                 _ = conn.Listen();
             }
@@ -263,7 +467,7 @@ class Program
 
         Discovery discovery = new Discovery();
 
-        discovery.PeerDiscovered += async (other_device_id, sender, other_port, proof) =>
+        discovery.PeerDiscovered += async (other_device_id, sender, other_port, proof, peerAddress) =>
         {
             // auto-trust: if this device wasn't already trusted, but it proved
             // knowledge of the same passphrase we have configured, trust it now —
@@ -275,7 +479,7 @@ class Program
                 && PassphraseAuth.VerifyProof(passphraseKeyStore.GetKey()!, other_device_id, proof))
             {
                 Console.WriteLine($"Auto-trusting {other_device_id} — proved knowledge of shared passphrase");
-                trustStore.Trust(other_device_id);
+                trustStore.Trust(other_device_id, peerAddress);
             }
 
             // connect only when the other device's public key is "smaller" than this device's public key (to avoid duplicate connections)
@@ -286,7 +490,7 @@ class Program
                 Console.WriteLine($"Discovered peer {other_device_id} at {other_port}");
                 try
                 {
-                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
+                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
                 }
                 catch (Exception)
                 {
@@ -311,7 +515,7 @@ class Program
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                         try
                         {
-                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, cts.Token);
+                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState, cts.Token);
                         }
                         catch (Exception)
                         {
@@ -329,6 +533,7 @@ class Program
         await discovery.Start(identity.GetPublicKey(), int.Parse(port), () =>
             passphraseKeyStore.HasPassphrase
                 ? PassphraseAuth.ComputeProof(passphraseKeyStore.GetKey()!, identity.GetPublicKey())
-                : null);
+                : null,
+            ownTailscaleAddress);
     }
 }

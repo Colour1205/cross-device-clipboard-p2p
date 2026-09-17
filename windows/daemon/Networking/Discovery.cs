@@ -21,7 +21,11 @@ public class Discovery
     // Result lets a peer that knows the same passphrase auto-trust this device
     // without any manual QR/key exchange — see Crypto/PassphraseAuth.cs.
     // "-" means "no passphrase configured", since the beacon is plain-text UDP.
-    public async Task Start(string deviceID, int tcpPort, Func<string?>? getProof = null)
+    //
+    // ownAddress is this device's off-LAN (Tailscale) address, if any — carried
+    // so passphrase auto-trust can cache it too, same as QR/manual pairing does,
+    // so passphrase-paired devices still get found later when off-LAN.
+    public async Task Start(string deviceID, int tcpPort, Func<string?>? getProof = null, string? ownAddress = null)
     {
         UdpClient client = new UdpClient();
         client.EnableBroadcast = true;
@@ -33,7 +37,7 @@ public class Discovery
             while (true)
             {
                 string? proof = getProof?.Invoke();
-                await Send(client, $"{tcpPort}:{deviceID}:{proof ?? "-"}");
+                await Send(client, $"{tcpPort}:{deviceID}:{proof ?? "-"}:{ownAddress ?? "-"}");
                 await Task.Delay(2000);
             }
         });
@@ -51,15 +55,16 @@ public class Discovery
                 int other_port = int.Parse(parts[0]);
                 string other_device_id = parts[1];
                 string? receivedProof = parts[2] == "-" ? null : parts[2];
+                string? receivedAddress = parts.Length > 3 && parts[3] != "-" ? parts[3] : null;
 
-                PeerDiscovered?.Invoke(other_device_id, sender, other_port, receivedProof);
+                PeerDiscovered?.Invoke(other_device_id, sender, other_port, receivedProof, receivedAddress);
             }
         });
 
         await Task.WhenAll(sendTask, receiveTask);
     }
 
-    public event Action<string, IPAddress, int, string?>? PeerDiscovered;
+    public event Action<string, IPAddress, int, string?, string?>? PeerDiscovered;
 
     private async Task Send(UdpClient client, string message)
     {

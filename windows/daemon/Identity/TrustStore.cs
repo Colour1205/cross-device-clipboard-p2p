@@ -17,11 +17,21 @@ public class TrustStore
         Directory.CreateDirectory(Path.Combine(app_data_dir, "ClipboardDaemon"));
         if (File.Exists(truststore_path))
         {
-            string json = File.ReadAllText(truststore_path);
-            var devices = System.Text.Json.JsonSerializer.Deserialize<List<TrustedDevice>>(json) ?? new List<TrustedDevice>();
-            foreach (var device in devices)
+            try
             {
-                trustedDevices[device.PublicKey] = device;
+                string json = File.ReadAllText(truststore_path);
+                var devices = System.Text.Json.JsonSerializer.Deserialize<List<TrustedDevice>>(json) ?? new List<TrustedDevice>();
+                foreach (var device in devices)
+                {
+                    trustedDevices[device.PublicKey] = device;
+                }
+            }
+            catch (System.Text.Json.JsonException ex)
+            {
+                // regenerate rather than crash — this does mean any existing pairings
+                // are lost and would need to be redone, but that's better than the
+                // daemon refusing to start at all
+                Console.WriteLine($"Could not load trust store ({ex.Message}) — starting with no trusted devices.");
             }
         }
     }

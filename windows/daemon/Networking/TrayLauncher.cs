@@ -19,6 +19,7 @@ public static class TrayLauncher
 
         if (!File.Exists(trayExe))
         {
+            Console.WriteLine($"Could not auto-start tray: no exe at expected path '{trayExe}' (build the tray project first, or it's laid out differently than the dev-time sibling-folder assumption).");
             return false;
         }
 
@@ -30,10 +31,12 @@ public static class TrayLauncher
                 Arguments = label,
                 UseShellExecute = false
             });
+            Console.WriteLine($"Auto-started tray app: {trayExe}");
             return true;
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Console.WriteLine($"Could not auto-start tray: {ex.Message}");
             return false;
         }
     }

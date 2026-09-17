@@ -17,13 +17,26 @@ public class DeviceIdentity
         string app_data_dir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         string key_path = Path.Combine(app_data_dir, "ClipboardDaemon", $"identity{deviceID}.key");
         Directory.CreateDirectory(Path.Combine(app_data_dir, "ClipboardDaemon"));
+        bool loaded = false;
         if (File.Exists(key_path))
         {
-            byte[] protectedBytes = File.ReadAllBytes(key_path);
-            byte[] pkcs8Bytes = System.Security.Cryptography.ProtectedData.Unprotect(protectedBytes, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
-            key.ImportPkcs8PrivateKey(pkcs8Bytes, out _);
+            try
+            {
+                byte[] protectedBytes = File.ReadAllBytes(key_path);
+                byte[] pkcs8Bytes = System.Security.Cryptography.ProtectedData.Unprotect(protectedBytes, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);
+                key.ImportPkcs8PrivateKey(pkcs8Bytes, out _);
+                loaded = true;
+            }
+            catch (Exception ex)
+            {
+                // corrupt file, DPAPI blob from a different user/machine, etc. —
+                // regenerate rather than crash the whole daemon on startup.
+                // Note: this does change the device's public key, so any existing
+                // pairings would need to be redone.
+                Console.WriteLine($"Could not load identity key ({ex.Message}) — generating a new one.");
+            }
         }
-        else
+        if (!loaded)
         {
             key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
             byte[] pkcs8Bytes = key.ExportPkcs8PrivateKey();

@@ -6,19 +6,26 @@
 namespace ClipboardDaemon.Clipboard;
 
 using System.Collections.Concurrent;
-
-// What Content holds for type == "file": the original name, plus the raw
-// file bytes, base64-encoded — same "Content is just a string, meaning
-// depends on Type" pattern as everything else, no ClipboardEntry changes needed.
-public record FilePayload(string FileName, string DataBase64);
+using ClipboardDaemon.Storage;
 
 public class ClipboardSync
 {
-    private const long MaxFileBytes = 1024L * 1024 * 1024; // 1GB — our transport buffers a whole file in memory at once (no chunked streaming), so this is a real memory ceiling, not just a network one
+    private const long MaxFileBytes = 1024L * 1024 * 1024; // 1GB — a ceiling against something absurd, not a memory constraint anymore now that this streams
+
+    private readonly FileStore fileStore;
 
     BlockingCollection<(string content, string type)> _pendingSets = new BlockingCollection<(string content, string type)>();
     private string? _lastKnownHash;
-    public event Action<(string content, string type)>? ClipboardChanged;
+
+    // sourceFilePath is only ever set for type == "file" — it's the local path
+    // to read the actual bytes from when streaming to peers. Program.cs uses
+    // it; nothing else in this class needs it once the event has fired.
+    public event Action<(string content, string type, string? sourceFilePath)>? ClipboardChanged;
+
+    public ClipboardSync(FileStore fileStore)
+    {
+        this.fileStore = fileStore;
+    }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     static extern uint GetClipboardSequenceNumber();
@@ -57,7 +64,7 @@ public class ClipboardSync
                             if (hash != _lastKnownHash)
                             {
                                 _lastKnownHash = hash;
-                                ClipboardChanged?.Invoke((Convert.ToBase64String(imageBytes), "image"));
+                                ClipboardChanged?.Invoke((Convert.ToBase64String(imageBytes), "image", null));
                             }
                         }
                     }
@@ -68,37 +75,12 @@ public class ClipboardSync
                         if (hash != _lastKnownHash)
                         {
                             _lastKnownHash = hash;
-                            ClipboardChanged?.Invoke((System.Windows.Forms.Clipboard.GetText(), "text"));
+                            ClipboardChanged?.Invoke((System.Windows.Forms.Clipboard.GetText(), "text", null));
                         }
                     }
                     else if (is_drop_lst)
                     {
-                        var files = System.Windows.Forms.Clipboard.GetFileDropList();
-                        // v1 scope: single file only — first entry, rest ignored
-                        if (files.Count > 0 && files[0] != null)
-                        {
-                            string path = files[0]!;
-                            var fileInfo = new FileInfo(path);
-                            if (!fileInfo.Exists)
-                            {
-                                Console.WriteLine($"skipping file drop, not a readable file: {path}");
-                            }
-                            else if (fileInfo.Length > MaxFileBytes)
-                            {
-                                Console.WriteLine($"skipping file drop, too large to sync ({fileInfo.Length} bytes, limit {MaxFileBytes}): {path}");
-                            }
-                            else
-                            {
-                                byte[] fileBytes = File.ReadAllBytes(path);
-                                string hash = ComputeHash(fileBytes);
-                                if (hash != _lastKnownHash)
-                                {
-                                    _lastKnownHash = hash;
-                                    var payload = new FilePayload(fileInfo.Name, Convert.ToBase64String(fileBytes));
-                                    ClipboardChanged?.Invoke((System.Text.Json.JsonSerializer.Serialize(payload), "file"));
-                                }
-                            }
-                        }
+                        HandleFileDropList();
                     }
                     else
                     {
@@ -126,6 +108,51 @@ public class ClipboardSync
         System.Windows.Forms.Application.Run();
     }
 
+    // Multiple files can be selected and copied together in Explorer — sync
+    // every one of them, not just the first, each as its own history entry.
+    private void HandleFileDropList()
+    {
+        var files = System.Windows.Forms.Clipboard.GetFileDropList();
+        var fileHashes = new List<string>();
+        var readableFiles = new List<(string path, FileInfo info, string hash)>();
+
+        foreach (string? path in files)
+        {
+            if (path == null) continue;
+            var fileInfo = new FileInfo(path);
+            if (!fileInfo.Exists)
+            {
+                Console.WriteLine($"skipping file drop, not a readable file: {path}");
+                continue;
+            }
+            if (fileInfo.Length > MaxFileBytes)
+            {
+                Console.WriteLine($"skipping file drop, too large to sync ({fileInfo.Length} bytes, limit {MaxFileBytes}): {path}");
+                continue;
+            }
+
+            using var stream = File.OpenRead(path);
+            string hash = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(stream)); // streams internally — never loads the whole file for hashing
+            fileHashes.Add(hash);
+            readableFiles.Add((path, fileInfo, hash));
+        }
+
+        if (readableFiles.Count == 0) return;
+
+        // echo-suppression covers the WHOLE selection (all files together),
+        // not each file individually — a combined discriminator from the
+        // sorted set of hashes, so selection order doesn't matter
+        string combinedHash = ComputeHash(System.Text.Encoding.UTF8.GetBytes(string.Join(",", fileHashes.OrderBy(h => h))));
+        if (combinedHash == _lastKnownHash) return;
+        _lastKnownHash = combinedHash;
+
+        foreach (var (path, info, hash) in readableFiles)
+        {
+            var payload = new FilePayload(info.Name, hash, info.Length);
+            ClipboardChanged?.Invoke((System.Text.Json.JsonSerializer.Serialize(payload), "file", path));
+        }
+    }
+
     public void addToQueue(string content, string type = "text")
     {
         _pendingSets.Add((content, type));
@@ -150,9 +177,13 @@ public class ClipboardSync
         {
             var payload = System.Text.Json.JsonSerializer.Deserialize<FilePayload>(content);
             if (payload == null) return;
-
-            byte[] fileBytes = Convert.FromBase64String(payload.DataBase64);
-            _lastKnownHash = ComputeHash(fileBytes);
+            if (!fileStore.Exists(payload.FileHash))
+            {
+                // we don't have the bytes yet (chunks still arriving, or this
+                // came from history reconciliation rather than a live transfer)
+                Console.WriteLine($"can't apply file '{payload.FileName}' yet — content not available locally");
+                return;
+            }
 
             string receivedDir = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -160,7 +191,8 @@ public class ClipboardSync
             Directory.CreateDirectory(receivedDir);
 
             string destPath = GetNonCollidingPath(receivedDir, payload.FileName);
-            File.WriteAllBytes(destPath, fileBytes);
+            File.Copy(fileStore.GetPath(payload.FileHash), destPath);
+            _lastKnownHash = ComputeHash(System.Text.Encoding.UTF8.GetBytes(payload.FileHash)); // suppress our own echo of this apply
 
             var fileList = new System.Collections.Specialized.StringCollection();
             fileList.Add(destPath);
