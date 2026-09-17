@@ -19,6 +19,7 @@ public class PeerConnection
         writer = new StreamWriter(stream) { AutoFlush = true };
     }
     public event Action<string>? MessageReceived;
+    public event Action? Disconnected;
     public async Task Send(string message)
     {
         await writer.WriteLineAsync(message);
@@ -28,7 +29,7 @@ public class PeerConnection
         while (true)
         {
             string? line = await reader.ReadLineAsync();
-            if (line == null) break; // peer disconnected
+            if (line == null) { Disconnected?.Invoke(); return; } // peer disconnected
             MessageReceived?.Invoke(line);
         }
         

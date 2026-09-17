@@ -48,4 +48,15 @@ public class HistoryAccess
         File.WriteAllText(history_path, json);
         return true;
     }
+    public Boolean clearHistory()
+    {
+        inMemoryHistory.Clear();
+        saveHistory();
+        return true;
+    }
+
+    public Boolean isEntryInHistory(ClipboardEntry entry)
+    {
+        return inMemoryHistory.Contains(entry);
+    }
 }
