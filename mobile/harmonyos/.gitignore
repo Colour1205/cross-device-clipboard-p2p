@@ -1,6 +1,10 @@
 /node_modules
 /oh_modules
 /local.properties
+# Contains DevEco Studio's locally-generated encrypted debug-signing
+# credentials (keyPassword/storePassword), tied to this machine's keystore
+# - rotates on every rebuild and has no business in source control.
+/build-profile.json5
 /.idea
 **/build
 /.hvigor
