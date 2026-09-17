@@ -35,7 +35,26 @@ public class ClipboardSync
 
                     last_sequence_num = curr_sequence_num;
 
-                    if (is_text)
+                    // check image before text: a copied bitmap is the thing the
+                    // user actually wants synced, even if Windows also exposes
+                    // some auto-generated text representation alongside it
+                    if (is_img)
+                    {
+                        using var image = System.Windows.Forms.Clipboard.GetImage();
+                        if (image != null)
+                        {
+                            using var ms = new MemoryStream();
+                            image.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+                            byte[] imageBytes = ms.ToArray();
+                            string hash = ComputeHash(imageBytes);
+                            if (hash != _lastKnownHash)
+                            {
+                                _lastKnownHash = hash;
+                                ClipboardChanged?.Invoke((Convert.ToBase64String(imageBytes), "image"));
+                            }
+                        }
+                    }
+                    else if (is_text)
                     {
                         string text = System.Windows.Forms.Clipboard.GetText();
                         string hash = ComputeHash(System.Text.Encoding.UTF8.GetBytes(text));
@@ -47,8 +66,11 @@ public class ClipboardSync
                     }
                     else
                     {
-                        // TODO handle other formats
-                        Console.WriteLine($"non-text change: img={is_img} audio={is_aud} files={is_drop_lst}");
+                        // Audio and file-drop entries aren't synced: a local file path
+                        // (e.g. C:\Users\...) is meaningless on another device without a
+                        // real file-transfer feature, which doesn't exist yet. Skip rather
+                        // than half-implement something that would silently do nothing useful.
+                        Console.WriteLine($"unsupported clipboard change: audio={is_aud} files={is_drop_lst}");
                     }
                 } catch (Exception)
                 {
@@ -77,14 +99,22 @@ public class ClipboardSync
 
     public void setContent(String content, string type = "text")
     {
-        _lastKnownHash = ComputeHash(System.Text.Encoding.UTF8.GetBytes(content));
         if (type == "text")
         {
+            _lastKnownHash = ComputeHash(System.Text.Encoding.UTF8.GetBytes(content));
             System.Windows.Forms.Clipboard.SetText(content);
+        }
+        else if (type == "image")
+        {
+            byte[] imageBytes = Convert.FromBase64String(content);
+            _lastKnownHash = ComputeHash(imageBytes);
+            using var ms = new MemoryStream(imageBytes);
+            using var image = System.Drawing.Image.FromStream(ms);
+            System.Windows.Forms.Clipboard.SetImage(image);
         }
         else
         {
-            throw new NotImplementedException("Only text clipboard is supported for now.");
+            throw new NotImplementedException($"Clipboard type '{type}' is not supported yet.");
         }
     }
 

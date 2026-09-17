@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "dgSpecHash": "yhPlNlGOeDw=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\Colour3070\\OneDrive\\Documents\\GitHub\\cross-device-clipboard-p2p\\windows\\tray\\ClipboardTray.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\Colour3070\\.nuget\\packages\\qrcoder\\1.6.0\\qrcoder.1.6.0.nupkg.sha512"
+  ],
+  "logs": []
+}

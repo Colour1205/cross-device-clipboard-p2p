@@ -1,0 +1,75 @@
+namespace ClipboardTray;
+
+class Program
+{
+    [STAThread]
+    static void Main(string[] args)
+    {
+        string label = args.Length > 0 ? args[0] : "default";
+        var ipcClient = new IpcClient(label);
+
+        // first-run: offer passcode-based auto-pairing setup. Blocking here (before
+        // Application.Run starts the message loop) is fine — same as a console app
+        // doing setup work before its main loop; there's no pump to deadlock against yet.
+        var hasPassphraseResponse = ipcClient.Send(new IpcRequest("has_passphrase")).GetAwaiter().GetResult();
+        if (hasPassphraseResponse != null && hasPassphraseResponse.Success && hasPassphraseResponse.Data == "False")
+        {
+            using var passcodeForm = new PasscodeForm();
+            if (passcodeForm.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(passcodeForm.EnteredPasscode))
+            {
+                ipcClient.Send(new IpcRequest("set_passphrase", passcodeForm.EnteredPasscode)).GetAwaiter().GetResult();
+            }
+        }
+
+        var menu = new ContextMenuStrip();
+
+        var showQrItem = new ToolStripMenuItem("Show My QR Code");
+        showQrItem.Click += async (s, e) =>
+        {
+            var response = await ipcClient.Send(new IpcRequest("get_pairing_info"));
+            var pairingInfo = response?.Data != null
+                ? System.Text.Json.JsonSerializer.Deserialize<PairingInfo>(response.Data)
+                : null;
+            if (response != null && response.Success && pairingInfo != null)
+            {
+                new QrCodeForm(pairingInfo).Show();
+            }
+            else
+            {
+                MessageBox.Show("Could not reach the daemon. Is it running?", "Error");
+            }
+        };
+
+        var trustItem = new ToolStripMenuItem("Trust a Device");
+        trustItem.Click += async (s, e) =>
+        {
+            using var form = new TrustDeviceForm();
+            if (form.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(form.EnteredKey))
+            {
+                var response = await ipcClient.Send(new IpcRequest("trust_device", form.EnteredKey));
+                if (response == null || !response.Success)
+                {
+                    MessageBox.Show("Could not reach the daemon. Is it running?", "Error");
+                }
+            }
+        };
+
+        var exitItem = new ToolStripMenuItem("Exit");
+        exitItem.Click += (s, e) => Application.Exit();
+
+        menu.Items.Add(showQrItem);
+        menu.Items.Add(trustItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(exitItem);
+
+        using var trayIcon = new NotifyIcon
+        {
+            Icon = System.Drawing.SystemIcons.Application,
+            Visible = true,
+            Text = "Clipboard P2P",
+            ContextMenuStrip = menu
+        };
+
+        Application.Run();
+    }
+}

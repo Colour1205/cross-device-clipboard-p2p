@@ -85,6 +85,39 @@ class Program
         var json = JsonSerializer.Serialize(envelope);
         _ = conn.Send(json);
     }
+
+    // Dials out to a peer at a known address and wires it up exactly the same
+    // way regardless of how that address was found — LAN discovery or a
+    // cached off-LAN (Tailscale) address from the trust store.
+    private static async Task ConnectToPeer(
+        string peerDeviceId,
+        string address,
+        int port,
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
+        ClipboardSync clipboardSync,
+        HistoryAccess historyAccess,
+        TrustStore trustStore,
+        CancellationToken cancellationToken = default)
+    {
+        TcpClient client = new TcpClient();
+        await client.ConnectAsync(address, port, cancellationToken);
+        var conn = new PeerConnection(client);
+        string? connectedDeviceId = peerDeviceId;
+        connectionsByDeviceId[peerDeviceId] = conn;
+
+        SendHistoryBatch(conn, historyAccess);
+
+        conn.MessageReceived += msg =>
+        {
+            HandleMessage(msg, ref connectedDeviceId, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
+        };
+        _ = conn.Listen();
+
+        conn.Disconnected += () =>
+        {
+            connectionsByDeviceId.TryRemove(peerDeviceId, out _);
+        };
+    }
     [STAThread]
     static async Task Main(String[] args)
     {
@@ -95,12 +128,63 @@ class Program
         var identity = new DeviceIdentity(label);
         var historyAccess = new HistoryAccess(label);
         TrustStore trustStore = new TrustStore(label);
+        var passphraseKeyStore = new PassphraseKeyStore(label);
         Console.WriteLine($"Device ID (public key): {identity.GetPublicKey()}");
 
         if (trustedKeyToAdd != null)
         {
             trustStore.Trust(trustedKeyToAdd);
         }
+
+        // local IPC for the tray app (QR pairing, passcode setup, etc.)
+        var ipcServer = new IpcServer(label);
+        ipcServer.RequestReceived += request =>
+        {
+            if (request.Command == "get_public_key")
+            {
+                return new IpcResponse(true, identity.GetPublicKey());
+            }
+            else if (request.Command == "get_pairing_info")
+            {
+                var pairingInfo = new PairingInfo(identity.GetPublicKey(), TailscaleHelper.GetOwnTailscaleIp());
+                return new IpcResponse(true, JsonSerializer.Serialize(pairingInfo));
+            }
+            else if (request.Command == "has_passphrase")
+            {
+                return new IpcResponse(true, passphraseKeyStore.HasPassphrase.ToString());
+            }
+            else if (request.Command == "set_passphrase" && request.Payload != null)
+            {
+                passphraseKeyStore.SetPassphrase(request.Payload);
+                return new IpcResponse(true, "passphrase set");
+            }
+            else if (request.Command == "trust_device" && request.Payload != null)
+            {
+                // accept either the new {PublicKey, Address} pairing payload, or a
+                // bare key (e.g. the CLI --trust flow, or an older tray build)
+                PairingInfo? pairingInfo = null;
+                try
+                {
+                    pairingInfo = JsonSerializer.Deserialize<PairingInfo>(request.Payload);
+                }
+                catch (JsonException) { /* not JSON — fall through to bare-key handling below */ }
+
+                if (pairingInfo != null && !string.IsNullOrWhiteSpace(pairingInfo.PublicKey))
+                {
+                    trustStore.Trust(pairingInfo.PublicKey, pairingInfo.Address);
+                }
+                else
+                {
+                    trustStore.Trust(request.Payload);
+                }
+                return new IpcResponse(true, "trusted");
+            }
+            else
+            {
+                return new IpcResponse(false, "unknown command");
+            }
+        };
+        _ = Task.Run(() => ipcServer.Start());
 
         ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId = new ConcurrentDictionary<string, PeerConnection>();
 
@@ -153,7 +237,10 @@ class Program
 
                 conn.Disconnected += () =>
                 {
-                    connectionsByDeviceId.TryRemove(other_device_id, out _);
+                    if (other_device_id != null)
+                    {
+                        connectionsByDeviceId.TryRemove(other_device_id, out _);
+                    }
                 };
                 _ = conn.Listen();
             }
@@ -165,38 +252,72 @@ class Program
 
         Discovery discovery = new Discovery();
 
-        discovery.PeerDiscovered += async (other_device_id, sender, other_port) =>
+        discovery.PeerDiscovered += async (other_device_id, sender, other_port, proof) =>
         {
+            // auto-trust: if this device wasn't already trusted, but it proved
+            // knowledge of the same passphrase we have configured, trust it now —
+            // an alternative to manual QR/key pairing for "these are all my own devices".
+            // Excludes our own id: UDP broadcasts loop back to the sender on
+            // localhost, so without this check a device would "auto-trust" itself.
+            if (other_device_id != identity.GetPublicKey()
+                && !trustStore.IsTrusted(other_device_id) && proof != null && passphraseKeyStore.HasPassphrase
+                && PassphraseAuth.VerifyProof(passphraseKeyStore.GetKey()!, other_device_id, proof))
+            {
+                Console.WriteLine($"Auto-trusting {other_device_id} — proved knowledge of shared passphrase");
+                trustStore.Trust(other_device_id);
+            }
+
             // connect only when the other device's public key is "smaller" than this device's public key (to avoid duplicate connections)
             // connect only if the other device is in the trust store
             if (!connectionsByDeviceId.ContainsKey(other_device_id) && other_device_id.CompareTo(identity.GetPublicKey()) < 0
             && trustStore.IsTrusted(other_device_id))
             {
                 Console.WriteLine($"Discovered peer {other_device_id} at {other_port}");
-                // connect to the peer
-                TcpClient client = new TcpClient();
-                await client.ConnectAsync(sender, other_port);
-                var conn = new PeerConnection(client);
-                string? connectedDeviceId = other_device_id;
-                connectionsByDeviceId[other_device_id] = conn;
-
-                // send history batch on connection
-                SendHistoryBatch(conn, historyAccess);
-
-                // message received
-                conn.MessageReceived += msg =>
+                try
                 {
-                    HandleMessage(msg, ref connectedDeviceId, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
-                };
-                _ = conn.Listen();
-
-                conn.Disconnected += () =>
+                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, connectionsByDeviceId, clipboardSync, historyAccess, trustStore);
+                }
+                catch (Exception)
                 {
-                    connectionsByDeviceId.TryRemove(other_device_id, out _);
-                };
+                    // peer wasn't actually reachable — ignore, we'll hear its next beacon
+                }
             }
 
         };
-        await discovery.Start(identity.GetPublicKey(), int.Parse(port));
+
+        // off-LAN reconnect loop: for trusted peers we have a cached address for
+        // (e.g. Tailscale, learned at pairing time) but aren't currently connected
+        // to — LAN discovery can't find these, so we have to proactively retry
+        _ = Task.Run(async () =>
+        {
+            while (true)
+            {
+                var attempts = trustStore.GetTrustedDevicesWithAddress()
+                    .Where(device => !connectionsByDeviceId.ContainsKey(device.PublicKey)
+                        && device.PublicKey.CompareTo(identity.GetPublicKey()) < 0)
+                    .Select(async device =>
+                    {
+                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                        try
+                        {
+                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), connectionsByDeviceId, clipboardSync, historyAccess, trustStore, cts.Token);
+                        }
+                        catch (Exception)
+                        {
+                            // not reachable via this address right now — retry next cycle
+                        }
+                    });
+
+                // run every attempt concurrently, so one offline peer's 5s timeout
+                // doesn't delay checking the others
+                await Task.WhenAll(attempts);
+                await Task.Delay(TimeSpan.FromSeconds(30));
+            }
+        });
+
+        await discovery.Start(identity.GetPublicKey(), int.Parse(port), () =>
+            passphraseKeyStore.HasPassphrase
+                ? PassphraseAuth.ComputeProof(passphraseKeyStore.GetKey()!, identity.GetPublicKey())
+                : null);
     }
 }

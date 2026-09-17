@@ -14,7 +14,14 @@ public class Discovery
 {
     // TODO
     public int PORT = 52388;
-    public async Task Start(string deviceID, int tcpPort)
+
+    // getProof is called fresh on every beacon, not just once at startup — a
+    // passphrase set later via the tray (the normal flow: daemon starts first,
+    // then the user sets a passcode) must take effect without a restart.
+    // Result lets a peer that knows the same passphrase auto-trust this device
+    // without any manual QR/key exchange — see Crypto/PassphraseAuth.cs.
+    // "-" means "no passphrase configured", since the beacon is plain-text UDP.
+    public async Task Start(string deviceID, int tcpPort, Func<string?>? getProof = null)
     {
         UdpClient client = new UdpClient();
         client.EnableBroadcast = true;
@@ -25,7 +32,8 @@ public class Discovery
         {
             while (true)
             {
-                await Send(client, $"{tcpPort}:{deviceID}");
+                string? proof = getProof?.Invoke();
+                await Send(client, $"{tcpPort}:{deviceID}:{proof ?? "-"}");
                 await Task.Delay(2000);
             }
         });
@@ -38,17 +46,20 @@ public class Discovery
                 string message = result.message;
                 IPAddress sender = result.sender;
                 string[] parts = message.Split(':');
+                if (parts.Length < 3) continue; // malformed/old-format beacon, ignore
+
                 int other_port = int.Parse(parts[0]);
                 string other_device_id = parts[1];
+                string? receivedProof = parts[2] == "-" ? null : parts[2];
 
-                PeerDiscovered?.Invoke(other_device_id, sender, other_port);
+                PeerDiscovered?.Invoke(other_device_id, sender, other_port, receivedProof);
             }
         });
 
         await Task.WhenAll(sendTask, receiveTask);
     }
 
-    public event Action<string, IPAddress, int>? PeerDiscovered;
+    public event Action<string, IPAddress, int, string?>? PeerDiscovered;
 
     private async Task Send(UdpClient client, string message)
     {
