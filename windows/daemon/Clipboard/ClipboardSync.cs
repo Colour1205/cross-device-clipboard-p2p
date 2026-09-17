@@ -47,7 +47,7 @@ public class ClipboardSync
                         // TODO handle other formats
                         Console.WriteLine($"non-text change: img={is_img} audio={is_aud} files={is_drop_lst}");
                     }
-                } catch (Exception ex)
+                } catch (Exception)
                 {
                     Console.WriteLine($"clipboard busy, will retry next poll");
                 }
@@ -57,7 +57,7 @@ public class ClipboardSync
             try{
                 setContent(pendingSet.content, pendingSet.type);
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                 Console.WriteLine($"clipboard busy, dropping this peer update for now");
             }

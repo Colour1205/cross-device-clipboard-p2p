@@ -26,11 +26,18 @@ public class PeerConnection
     }
     public async Task Listen()
     {
+
+        try{
         while (true)
         {
             string? line = await reader.ReadLineAsync();
             if (line == null) { Disconnected?.Invoke(); return; } // peer disconnected
             MessageReceived?.Invoke(line);
+        }
+        } catch (Exception){}
+        finally
+        {
+            Disconnected?.Invoke();
         }
         
     }

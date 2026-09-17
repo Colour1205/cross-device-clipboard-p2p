@@ -22,8 +22,7 @@ public class TrustStore
     }
     public bool IsTrusted(string key)
     {
-        // debug return trustedKeys.Contains(key);
-        return true; // for now, trust all keys
+        return trustedKeys.Contains(key);
     }
     public void Trust(string key)
     {

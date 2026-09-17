@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("ClipboardDaemon")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e59c1acee6b9f87bc9ede55cdb3818686169df20")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+7712282c5c193b46532ae96525ee81dca918f5a4")]
 [assembly: System.Reflection.AssemblyProductAttribute("ClipboardDaemon")]
 [assembly: System.Reflection.AssemblyTitleAttribute("ClipboardDaemon")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
