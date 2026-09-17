@@ -23,6 +23,8 @@ class Program
 
     private static void HandleMessage(
         string msg,
+        PeerConnection conn,
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
         ClipboardSync clipboardSync,
         HistoryAccess historyAccess,
         TrustStore trustStore,
@@ -52,7 +54,7 @@ class Program
 
             if (entry.Type == "file")
             {
-                HandleIncomingFileEntry(entry, clipboardSync, fileStore, fileTransferState);
+                HandleIncomingFileEntry(entry, clipboardSync, fileStore, fileTransferState, connectionsByDeviceId);
             }
             else
             {
@@ -77,14 +79,12 @@ class Program
                 }
                 if (historyAccess.addToHistory(entry)) // true only if genuinely new, not a duplicate
                 {
-                    // Reconciliation only carries the small descriptor for file
-                    // entries, never the bytes (re-streaming a whole mesh's worth
-                    // of file history on every reconnect isn't attempted here) —
-                    // so only apply immediately if we already happen to have this
-                    // exact content cached locally.
                     if (entry.Type == "file")
                     {
-                        HandleIncomingFileEntry(entry, clipboardSync, fileStore, fileTransferState, onlyIfAlreadyCached: true);
+                        // same handling as a live entry now: if we don't have the
+                        // bytes, ask the whole network for them, not just whoever
+                        // we're reconciling with
+                        HandleIncomingFileEntry(entry, clipboardSync, fileStore, fileTransferState, connectionsByDeviceId);
                     }
                     else
                     {
@@ -96,6 +96,10 @@ class Program
         else if (envelope.Type == "file_chunk")
         {
             HandleFileChunk(envelope.Payload, fileStore, fileTransferState, clipboardSync);
+        }
+        else if (envelope.Type == "file_request")
+        {
+            HandleFileRequest(envelope.Payload, fileStore, conn);
         }
         else
         {
@@ -109,7 +113,7 @@ class Program
         ClipboardSync clipboardSync,
         FileStore fileStore,
         FileTransferState fileTransferState,
-        bool onlyIfAlreadyCached = false)
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId)
     {
         FilePayload? payload;
         try
@@ -128,13 +132,43 @@ class Program
         {
             // already have these exact bytes locally — apply right away
             clipboardSync.addToQueue(entry.Content, entry.Type);
+            return;
         }
-        else if (!onlyIfAlreadyCached)
+
+        // don't have it yet — remember to apply it once file_chunk messages for
+        // this hash finish arriving and verify, and ask every connected peer
+        // (not just whoever handed us this entry) whether they have it
+        fileTransferState.PendingEntries[payload.FileHash] = entry;
+        BroadcastFileRequest(payload.FileHash, connectionsByDeviceId);
+    }
+
+    private static void BroadcastFileRequest(string fileHash, ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId)
+    {
+        var request = new FileRequestMessage(fileHash);
+        var envelope = new Envelope("file_request", JsonSerializer.Serialize(request));
+        var json = JsonSerializer.Serialize(envelope);
+        foreach (var conn in connectionsByDeviceId.Values)
         {
-            // don't have it yet — remember to apply it once file_chunk messages
-            // for this hash finish arriving and verify
-            fileTransferState.PendingEntries[payload.FileHash] = entry;
+            _ = conn.Send(json);
         }
+    }
+
+    private static void HandleFileRequest(string payloadJson, FileStore fileStore, PeerConnection requestingConn)
+    {
+        FileRequestMessage? request;
+        try
+        {
+            request = JsonSerializer.Deserialize<FileRequestMessage>(payloadJson);
+        }
+        catch (JsonException) { request = null; }
+        if (request == null) return;
+
+        if (fileStore.Exists(request.FileHash))
+        {
+            _ = StreamFileToPeer(requestingConn, fileStore.GetPath(request.FileHash), request.FileHash);
+        }
+        // if we don't have it either, just don't respond — the requester
+        // already broadcast to everyone else too; someone else might have it
     }
 
     private static void HandleFileChunk(
@@ -197,8 +231,20 @@ class Program
         }
 
         File.Move(tempPath, fileStore.GetPath(chunk.FileHash), overwrite: true);
+        TryFulfillPendingEntry(chunk.FileHash, fileTransferState, clipboardSync);
+    }
 
-        if (fileTransferState.PendingEntries.TryRemove(chunk.FileHash, out var pendingEntry))
+    // FileStore can gain a blob through more than one path — chunk-stream
+    // completion (above), but also a device's own local capture of a file it
+    // happens to have independently obtained (e.g. self-detecting the same
+    // file another process just applied, on a shared clipboard during local
+    // testing — or, in principle, any other future path that populates
+    // FileStore). Whichever way a hash becomes available, a pending entry
+    // waiting on exactly that hash should get applied — not just when the
+    // chunk-reassembly path happens to be the one that completed it.
+    private static void TryFulfillPendingEntry(string fileHash, FileTransferState fileTransferState, ClipboardSync clipboardSync)
+    {
+        if (fileTransferState.PendingEntries.TryRemove(fileHash, out var pendingEntry))
         {
             clipboardSync.addToQueue(pendingEntry.Content, pendingEntry.Type);
         }
@@ -277,7 +323,7 @@ class Program
         connectionsByDeviceId[peerDeviceId] = conn;
         SendHistoryBatch(conn, historyAccess);
 
-        conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+        conn.MessageReceived += msg => HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
         conn.Disconnected += () => connectionsByDeviceId.TryRemove(peerDeviceId, out _);
         _ = conn.Listen();
     }
@@ -416,6 +462,11 @@ class Program
                         {
                             _ = StreamFileToPeer(conn, fileStore.GetPath(payload.FileHash), payload.FileHash);
                         }
+                        // this exact content might already be something we were
+                        // waiting on from a peer (e.g. this device independently
+                        // captured the same file another connected device just
+                        // applied) — fulfill that now rather than leaving it stuck
+                        TryFulfillPendingEntry(payload.FileHash, fileTransferState, clipboardSync);
                     }
                 }
             }
@@ -455,7 +506,7 @@ class Program
                 connectionsByDeviceId[conn.PeerDeviceId] = conn;
                 SendHistoryBatch(conn, historyAccess);
 
-                conn.MessageReceived += msg => HandleMessage(msg, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+                conn.MessageReceived += msg => HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
                 conn.Disconnected += () => connectionsByDeviceId.TryRemove(conn.PeerDeviceId, out _);
                 _ = conn.Listen();
             }

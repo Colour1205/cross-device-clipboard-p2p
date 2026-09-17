@@ -13,8 +13,9 @@ public class ClipboardSync
     private const long MaxFileBytes = 1024L * 1024 * 1024; // 1GB — a ceiling against something absurd, not a memory constraint anymore now that this streams
 
     private readonly FileStore fileStore;
+    private const int MaxApplyAttempts = 5;
 
-    BlockingCollection<(string content, string type)> _pendingSets = new BlockingCollection<(string content, string type)>();
+    BlockingCollection<(string content, string type, int attempts)> _pendingSets = new BlockingCollection<(string content, string type, int attempts)>();
     private string? _lastKnownHash;
 
     // sourceFilePath is only ever set for type == "file" — it's the local path
@@ -95,12 +96,28 @@ public class ClipboardSync
             }
             // push content from the queue to the clipboard
             if (_pendingSets.TryTake(out var pendingSet))
-            try{
-                setContent(pendingSet.content, pendingSet.type);
-            }
-            catch (Exception)
             {
-                Console.WriteLine($"clipboard busy, dropping this peer update for now");
+                try
+                {
+                    setContent(pendingSet.content, pendingSet.type);
+                }
+                catch (Exception)
+                {
+                    // TryTake already removed it — if we don't put it back, a
+                    // transient failure (e.g. clipboard contention) silently
+                    // loses this peer update forever instead of just retrying
+                    // once the contention clears, the way local detection already does.
+                    int nextAttempt = pendingSet.attempts + 1;
+                    if (nextAttempt < MaxApplyAttempts)
+                    {
+                        Console.WriteLine($"clipboard busy, will retry this peer update (attempt {nextAttempt}/{MaxApplyAttempts})");
+                        _pendingSets.Add((pendingSet.content, pendingSet.type, nextAttempt));
+                    }
+                    else
+                    {
+                        Console.WriteLine($"clipboard busy, giving up on this peer update after {MaxApplyAttempts} attempts");
+                    }
+                }
             }
         };
 
@@ -155,7 +172,7 @@ public class ClipboardSync
 
     public void addToQueue(string content, string type = "text")
     {
-        _pendingSets.Add((content, type));
+        _pendingSets.Add((content, type, 0));
     }
 
     public void setContent(String content, string type = "text")
