@@ -105,6 +105,7 @@ struct Index {
   @State hasPassphrase: boolean = false;
   @State passphraseInput: string = '';
   @State passphraseStatus: string = '';
+  @State settingPassphrase: boolean = false;
   @State scanStatus: string = '';
 
   private watcher: ClipboardWatcher = new ClipboardWatcher();
@@ -263,6 +264,12 @@ struct Index {
     const context = getContext(this) as common.UIAbilityContext;
     await this.trustStore.untrust(context, deviceId);
     await this.refreshTrustedDevices();
+    // Explicit confirmation matters here: a just-untrusted device doesn't
+    // vanish from the Devices list if it's still actively beaconing (it
+    // reappears as "discovered" with a Trust button instead of "trusted"
+    // with Remove) - without this, tapping Remove on a device that's still
+    // on the LAN looks like it silently did nothing.
+    this.syncLog = [`untrusted ${deviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
   }
 
   private async refreshPassphraseState(): Promise<void> {
@@ -279,13 +286,31 @@ struct Index {
   }
 
   async setPassphrase(): Promise<void> {
+    if (this.settingPassphrase) return; // already running - ignore a double-tap
     const passphrase = this.passphraseInput.trim();
-    if (passphrase.length === 0) return;
-    const context = getContext(this) as common.UIAbilityContext;
-    await this.passphraseKeyStore.setPassphrase(context, passphrase);
-    this.passphraseInput = '';
-    await this.refreshPassphraseState();
-    this.passphraseStatus = 'Passcode set — other devices using the same passcode will auto-trust.';
+    if (passphrase.length === 0) {
+      this.passphraseStatus = 'Enter a passcode first.';
+      return;
+    }
+    // PassphraseKeyStore.setPassphrase runs PBKDF2 at 210,000 iterations
+    // (fixed to match the Windows side - see PassphraseKeyStore.ets) via
+    // cryptoFramework, awaited per round - this can take several seconds
+    // on-device. Without this pending state the button looked broken:
+    // nothing visibly happened until it finally resolved.
+    this.settingPassphrase = true;
+    this.passphraseStatus = 'Setting passcode... this can take a few seconds.';
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      await this.passphraseKeyStore.setPassphrase(context, passphrase);
+      this.passphraseInput = '';
+      await this.refreshPassphraseState();
+      this.passphraseStatus = 'Passcode set — other devices using the same passcode will auto-trust.';
+    } catch (e) {
+      const be = e as BusinessError;
+      this.passphraseStatus = `Failed to set passcode: ${be.message ?? e}`;
+    } finally {
+      this.settingPassphrase = false;
+    }
   }
 
   // Mirrors Program.cs's auto-trust block in discovery.PeerDiscovered: if
@@ -333,7 +358,13 @@ struct Index {
       const address: string | undefined = pairingInfo !== null && typeof pairingInfo.Address === 'string' ? pairingInfo.Address : undefined;
       await this.trustStore.trust(context, publicKey, address);
       await this.refreshTrustedDevices();
-      this.scanStatus = `trusted ${publicKey.slice(0, 12)}...`;
+      // Trusting is one-directional, same as Windows's TrustDeviceForm -
+      // this device now trusts the scanned one, but PeerConnection refuses
+      // any handshake unless BOTH sides trust each other (see
+      // PeerConnection.ets's isTrusted check right after parsing the
+      // peer's handshake). The other device still needs to add this
+      // device's ID - copy it from the "Your device ID" card above.
+      this.scanStatus = `Trusted ${publicKey.slice(0, 12)}... — now add THIS device's ID (above) on that device too, or it still won't connect.`;
     } catch (e) {
       const be = e as BusinessError;
       if (be.code === 1000500002) {
@@ -543,6 +574,27 @@ struct Index {
           Text('No devices yet. Trusted devices and nearby devices on the same network will show up here.')
             .fontSize(12).fontColor('#999999')
         }
+
+        // syncLog is where every connect/disconnect/trust/untrust event
+        // already gets recorded (see e.g. untrustDevice, connectToBeacon) -
+        // it just had nowhere to be seen before, which made actions like
+        // "Remove" look like they silently did nothing even when they'd
+        // worked (a removed-but-still-beaconing device reappears here as
+        // "discovered" rather than disappearing, which reads the same way
+        // without this confirmation).
+        if (this.syncLog.length > 0) {
+          Column({ space: 4 }) {
+            Text('Recent activity').fontSize(13).fontColor('#666666')
+            ForEach(this.syncLog.slice(0, 8), (line: string, index: number) => {
+              Text(line).fontSize(11).fontColor('#999999')
+            }, (line: string, index: number) => `${index}-${line}`)
+          }
+          .width('100%')
+          .padding(10)
+          .borderRadius(12)
+          .systemMaterial(this.materialCard())
+          .alignItems(HorizontalAlign.Start)
+        }
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
@@ -603,8 +655,12 @@ struct Index {
             TextInput({ placeholder: 'Enter a shared passcode', text: this.passphraseInput })
               .type(InputType.Password)
               .fontSize(13)
+              .enabled(!this.settingPassphrase)
               .onChange((value: string) => { this.passphraseInput = value; })
-            Button('Set Passcode').fontSize(12).onClick(() => { void this.setPassphrase(); })
+            Button(this.settingPassphrase ? 'Setting...' : 'Set Passcode')
+              .fontSize(12)
+              .enabled(!this.settingPassphrase)
+              .onClick(() => { void this.setPassphrase(); })
           }
           if (this.passphraseStatus.length > 0) {
             Text(this.passphraseStatus).fontSize(11).fontColor('#666666')
