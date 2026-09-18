@@ -1,222 +1,516 @@
-// Step 3 of the build order in ../../../../README.md: clipboard read + watch.
-// Real app screen (replaces the throwaway protocol-compatibility spike from
-// step 2 — those findings are preserved in README.md and git history).
+// Step 9 of the build order in ../../../../README.md: foreground-only
+// lifecycle wiring + minimal real UI. Replaces the diagnostic dashboard
+// steps 3-8 were built and verified against (that history is preserved in
+// git log and README.md) with an actual app screen: a floating pill bottom
+// nav (Synced / Devices / Me, Immersive Material per API 26.0.0's
+// uiMaterial), edge-to-edge layout with manually-computed safe-area
+// padding (see EntryAbility.ets for the full-screen window setup), elastic
+// (Spring) over-scroll, and auto-connect to already-trusted peers as soon
+// as their beacon is heard (the actual "foreground lifecycle" requirement
+// - sync starts on its own when the app opens, no manual taps needed).
 //
-// Proves the clipboard side works end to end on-device: change detection,
-// tap-triggered read (see ClipboardWatcher.ets for why), content hashing,
-// text/image handling. No networking yet — that's steps 5+.
+// Sync itself (steps 3, 8) is unchanged under the hood - this is a UI/
+// orchestration layer on top of ClipboardWatcher, Discovery, TcpServer,
+// PeerConnection, and SyncManager, all built and verified in earlier steps.
 
 import { common } from '@kit.AbilityKit';
-import { cryptoFramework } from '@kit.CryptoArchitectureKit';
-import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { ClipboardWatcher, ClipboardChange } from '../clipboard/ClipboardWatcher';
+import { window } from '@kit.ArkUI';
+import uiMaterial from '@ohos.arkui.uiMaterial';
+import { ClipboardWatcher } from '../clipboard/ClipboardWatcher';
 import { DeviceIdentity } from '../identity/DeviceIdentity';
-import { TrustStore } from '../identity/TrustStore';
-import { PassphraseKeyStore } from '../identity/PassphraseKeyStore';
+import { TrustStore, TrustedDevice } from '../identity/TrustStore';
 import { FileStore } from '../storage/FileStore';
-import { derToRaw, rawToDer } from '../crypto/EcdsaDer';
+import { Discovery, PeerBeacon } from '../networking/Discovery';
+import { TcpServer, connectTcp } from '../networking/TcpTransport';
+import { PeerConnection, TcpSocketAdapter, TcpSocketConnectionAdapter } from '../networking/PeerConnection';
+import { SyncManager } from '../networking/SyncManager';
+import { signEntry, ClipboardEntry } from '../crypto/Signing';
+import { ApplyResult } from '../clipboard/ClipboardApply';
+import socket from '@ohos.net.socket';
 
-function stringToBytes(s: string): Uint8Array {
-  return new Uint8Array(Array.from(s).map(c => c.charCodeAt(0)));
+const TCP_PORT = 52389;
+
+// Merged view of a device for the UI - could be trusted, discovered (via
+// beacon), connected, or any combination. A device the user has never
+// trusted but whose beacon we've heard is "discovered only"; a trusted
+// device we haven't heard from recently is "trusted only".
+interface DeviceRow {
+  deviceId: string;
+  address: string | null;
+  trusted: boolean;
+  discovered: boolean;
+  tcpPort: number | null;
+  connected: boolean;
 }
 
-function toHex(data: Uint8Array): string {
-  let out = '';
-  for (let i = 0; i < data.length; i++) {
-    out += data[i].toString(16).padStart(2, '0');
+// A single synced clipboard item for the list UI - built from a verified
+// ClipboardEntry (see SyncManager.onEntryApplied), not a raw log line.
+interface SyncedItem {
+  // Signature is unique per (content, type, deviceId, timestamp) - used as
+  // the ForEach key below. `time` is deliberately truncated to HH:MM for
+  // display and must NEVER be reused as a key: two copies from the same
+  // source within the same minute would then collide on the same key,
+  // and ArkUI would reuse the stale rendered node instead of updating its
+  // text - the list visually "gets stuck" showing the first copy forever
+  // even though new entries keep arriving and applying correctly.
+  id: string;
+  type: string;
+  preview: string;
+  source: string;
+  time: string;
+  fromPeer: boolean;
+}
+
+function previewFor(entry: ClipboardEntry): string {
+  if (entry.Type === 'text') {
+    return entry.Content.length > 80 ? `${entry.Content.slice(0, 80)}...` : entry.Content;
+  } else if (entry.Type === 'image') {
+    return 'Image';
+  } else if (entry.Type === 'file') {
+    return 'File';
   }
-  return out;
+  return entry.Content;
 }
 
 @Entry
 @Component
 struct Index {
-  @State pendingChange: boolean = false; // 'update' fired, not yet read
-  @State entries: ClipboardChange[] = [];
-  @State lastReadStatus: string = '';
-  @State step4Status: string = 'not run yet';
-  @State step4Detail: string = '';
+  @State ownDeviceId: string = '';
+  @State receivedBeacons: PeerBeacon[] = [];
+  @State trustedDevices: TrustedDevice[] = [];
+  @State pendingChange: boolean = false;
+  @State lastSyncStatus: string = '';
+  @State syncLog: string[] = [];
+  @State syncedItems: SyncedItem[] = [];
+  @State immersiveSupported: boolean = false;
+  @State selfTestStatus: string = 'not run yet';
+  @State topInsetVp: number = 0;
+  @State bottomInsetVp: number = 0;
+  @State currentTabIndex: number = 0;
 
   private watcher: ClipboardWatcher = new ClipboardWatcher();
+  private discovery: Discovery = new Discovery();
+  private tcpServer: TcpServer = new TcpServer();
+  private trustStore: TrustStore = new TrustStore();
+  private syncManager: SyncManager | null = null;
+  private connectingTo: Set<string> = new Set();
 
   aboutToAppear(): void {
+    this.immersiveSupported = uiMaterial.isImmersiveMaterialSupported();
+
+    const context = getContext(this) as common.UIAbilityContext;
+    window.getLastWindow(context).then((win: window.Window) => {
+      const avoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+      this.topInsetVp = px2vp(avoidArea.topRect.height);
+      this.bottomInsetVp = px2vp(avoidArea.bottomRect.height);
+    }).catch(() => { /* fall back to zero insets if the query fails */ });
+
     this.watcher.onPasteboardChanged(() => {
       this.pendingChange = true;
     });
     this.watcher.startListening();
+
+    const fileStore = new FileStore(context);
+    const syncManager = new SyncManager(fileStore, this.trustStore, context);
+    syncManager.onEntryApplied((entry: ClipboardEntry, result: ApplyResult, fromPeer: boolean) => {
+      const item: SyncedItem = {
+        id: entry.Signature ?? `${entry.DeviceId}:${entry.Timestamp}`,
+        type: entry.Type,
+        preview: previewFor(entry),
+        source: entry.DeviceId === this.ownDeviceId ? 'This device' : `${entry.DeviceId.slice(0, 12)}...`,
+        time: entry.Timestamp.slice(11, 16),
+        fromPeer,
+      };
+      this.syncedItems = [item, ...this.syncedItems].slice(0, 50);
+    });
+    syncManager.onLog((message: string) => {
+      this.syncLog = [message, ...this.syncLog].slice(0, 30);
+    });
+    this.syncManager = syncManager;
+
+    this.tcpServer.onConnection((conn: socket.TCPSocketConnection) => {
+      const identity = new DeviceIdentity();
+      PeerConnection.create(new TcpSocketConnectionAdapter(conn), identity, this.trustStore, context)
+        .then((peerConn: PeerConnection | null) => {
+          if (peerConn === null) {
+            conn.close().catch(() => { /* already closed - fine */ });
+            return;
+          }
+          this.syncLog = [`connected: ${peerConn.peerDeviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+          this.syncManager?.registerConnection(peerConn);
+        });
+    });
+    this.tcpServer.start(TCP_PORT).catch((e: BusinessError) => {
+      this.syncLog = [`TCP server error: ${e.message}`, ...this.syncLog].slice(0, 30);
+    });
+
+    this.discovery.onPeerDiscovered((beacon: PeerBeacon) => {
+      const existingIndex = this.receivedBeacons.findIndex(b => b.deviceId === beacon.deviceId);
+      if (existingIndex === -1) {
+        this.receivedBeacons = [beacon, ...this.receivedBeacons].slice(0, 30);
+      } else {
+        const updated = this.receivedBeacons.slice();
+        updated[existingIndex] = beacon;
+        this.receivedBeacons = updated;
+      }
+      void this.maybeAutoConnect(beacon);
+    });
+
+    const identity = new DeviceIdentity();
+    identity.getPublicKeyBase64().then((id: string) => {
+      this.ownDeviceId = id;
+      void this.discovery.start(id, TCP_PORT, () => null, null);
+    });
+
+    void this.refreshTrustedDevices();
   }
 
   aboutToDisappear(): void {
     this.watcher.stopListening();
+    this.discovery.stop();
+    this.tcpServer.stop();
   }
 
-  // Step 4 diagnostics: identity (HUKS sign + DER->raw conversion,
-  // round-tripped through cryptoFramework verify against our own exported
-  // key), trust store, passphrase key, file store. All new, untested API
-  // surface — worth confirming on-device before building networking on
-  // top of any of it, same lesson as the step-2 spike.
-  async runStep4Diagnostics() {
-    this.step4Status = 'running...';
-    this.step4Detail = '';
+  private async refreshTrustedDevices(): Promise<void> {
     const context = getContext(this) as common.UIAbilityContext;
+    this.trustedDevices = await this.trustStore.getAllTrustedDevices(context);
+  }
 
+  // The actual "foreground lifecycle" requirement: connect automatically
+  // to any already-trusted device as soon as its beacon is heard, no user
+  // action needed. Tie-breaker matches Discovery.cs's Windows logic
+  // (only the smaller-public-key side initiates) so both devices don't
+  // simultaneously dial each other.
+  private async maybeAutoConnect(beacon: PeerBeacon): Promise<void> {
+    if (beacon.deviceId === this.ownDeviceId) return;
+    if (this.syncManager?.isConnected(beacon.deviceId)) return;
+    if (this.connectingTo.has(beacon.deviceId)) return;
+    if (beacon.deviceId >= this.ownDeviceId) return;
+
+    const context = getContext(this) as common.UIAbilityContext;
+    const isTrusted = await this.trustStore.isTrusted(context, beacon.deviceId);
+    if (!isTrusted) return;
+
+    this.connectingTo.add(beacon.deviceId);
     try {
-      // --- Identity: sign + verify round-trip ---
-      const identity = new DeviceIdentity();
-      const publicKeyBase64 = await identity.getPublicKeyBase64();
-      this.step4Detail += `identity public key (base64, first 40 chars): ${publicKeyBase64.slice(0, 40)}...\n`;
-
-      // HarmonyOS's own cryptoFramework Verify only ever accepts DER
-      // signatures (confirmed: raw r||s is flatly rejected even when it's
-      // the exact same mathematical signature, proven below by the
-      // round-trip check) - unlike .NET's ECDsa, which defaults to raw.
-      // So: derToRaw() is only needed at the wire boundary (outgoing, so
-      // Windows/.NET can verify it), and rawToDer() before verifying any
-      // *incoming* signature here, regardless of which platform sent it -
-      // the wire format is always raw (matching Windows' native shape).
-      const message = stringToBytes('step4-diagnostic-message');
-      const derSignature = await identity.signRawDer(message);
-      const rawSignature = derToRaw(derSignature);
-      const reEncodedDer = rawToDer(rawSignature);
-      const conversionRoundTripsCorrectly = toHex(reEncodedDer) === toHex(derSignature);
-      this.step4Detail +=
-        `DER signature (${derSignature.length} bytes): ${toHex(derSignature)}\n` +
-        `raw signature (${rawSignature.length} bytes): ${toHex(rawSignature)}\n` +
-        `conversion round-trips correctly (rawToDer(derToRaw(x)) === x): ${conversionRoundTripsCorrectly}\n\n`;
-      if (!conversionRoundTripsCorrectly) {
-        throw new Error('EcdsaDer conversion is broken - round trip does not reproduce the original DER bytes');
-      }
-
-      const keyGen = cryptoFramework.createAsyKeyGenerator('ECC256');
-      const publicKeyBytes = new util.Base64Helper().decodeSync(publicKeyBase64);
-      const keyPair = await keyGen.convertKey({ data: publicKeyBytes }, null);
-
-      // The correct self-verify: HarmonyOS's own verify wants DER, so feed
-      // it DER (either the original, or a round-tripped one - both should
-      // work; using the round-tripped one here also re-proves the
-      // conversion is usable, not just byte-identical in isolation).
-      const verifier = cryptoFramework.createVerify('ECC256|SHA256');
-      await verifier.init(keyPair.pubKey);
-      await verifier.update({ data: message });
-      const verified = await verifier.verify(null, { data: rawToDer(rawSignature) });
-      this.step4Detail += `self-verify (via round-tripped DER): ${verified ? 'OK' : 'FAILED'}\n\n`;
-      if (!verified) throw new Error('self-verify failed even with DER - deeper bug, needs investigation');
-
-      // --- Trust store round-trip ---
-      const trustStore = new TrustStore();
-      const fakeDeviceKey = 'diagnostic-fake-device-key';
-      await trustStore.trust(context, fakeDeviceKey, '192.168.1.1');
-      const isTrusted = await trustStore.isTrusted(context, fakeDeviceKey);
-      const allTrusted = await trustStore.getAllTrustedDevices(context);
-      await trustStore.untrust(context, fakeDeviceKey);
-      const isTrustedAfterUntrust = await trustStore.isTrusted(context, fakeDeviceKey);
-      this.step4Detail +=
-        `trust store: trusted=${isTrusted}, count=${allTrusted.length}, ` +
-        `untrusted-after-remove=${!isTrustedAfterUntrust}\n\n`;
-      if (!isTrusted || isTrustedAfterUntrust) throw new Error('trust store round-trip failed');
-
-      // --- Passphrase key round-trip ---
-      const passphraseStore = new PassphraseKeyStore();
-      await passphraseStore.setPassphrase(context, 'diagnostic-test-passphrase');
-      const hasPassphrase = await passphraseStore.hasPassphrase(context);
-      const key = await passphraseStore.getKey(context);
-      const proof = await passphraseStore.computeProof(key!, 'some-device-id');
-      const proofValid = await passphraseStore.verifyProof(key!, 'some-device-id', proof);
-      const proofInvalid = await passphraseStore.verifyProof(key!, 'some-device-id', 'bm90LXRoZS1wcm9vZg==');
-      this.step4Detail +=
-        `passphrase key: hasPassphrase=${hasPassphrase}, keyBytes=${key?.length}, ` +
-        `validProofAccepted=${proofValid}, invalidProofRejected=${!proofInvalid}\n\n`;
-      if (!hasPassphrase || key === null || !proofValid || proofInvalid) {
-        throw new Error('passphrase key round-trip failed');
-      }
-
-      // --- File store smoke test ---
-      const fileStore = new FileStore(context);
-      const fakeHash = 'diagnostic-fake-hash';
-      const existedBefore = fileStore.exists(fakeHash);
-      this.step4Detail += `file store: path=${fileStore.getPath(fakeHash)}, existsForFakeHash=${existedBefore}\n`;
-
-      this.step4Status = 'ALL PASSED';
-    } catch (e) {
-      this.step4Status = 'FAILED';
-      const be = e as BusinessError;
-      this.step4Detail += `error: ${be.message ?? e}\ncode: ${be.code}`;
+      await this.connectToBeacon(beacon);
+    } finally {
+      this.connectingTo.delete(beacon.deviceId);
     }
+  }
+
+  private async connectToBeacon(beacon: PeerBeacon): Promise<void> {
+    try {
+      const client = await connectTcp(beacon.senderIp, beacon.tcpPort);
+      const identity = new DeviceIdentity();
+      const context = getContext(this) as common.UIAbilityContext;
+      const conn = await PeerConnection.create(new TcpSocketAdapter(client), identity, this.trustStore, context);
+      if (conn === null) {
+        client.close().catch(() => { /* already closed - fine */ });
+        this.syncLog = [`connect failed: ${beacon.deviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+        return;
+      }
+      this.syncLog = [`connected: ${conn.peerDeviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+      this.syncManager?.registerConnection(conn);
+    } catch (e) {
+      const be = e as BusinessError;
+      this.syncLog = [`connect error (${beacon.senderIp}:${beacon.tcpPort}): ${be.message}`, ...this.syncLog].slice(0, 30);
+    }
+  }
+
+  // Trusting a freshly-discovered device also immediately attempts to
+  // connect to it (rather than waiting for its next beacon) - feels more
+  // responsive when the user just tapped Trust specifically to connect.
+  async trustAndConnect(beacon: PeerBeacon): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    await this.trustStore.trust(context, beacon.deviceId, beacon.senderIp);
+    await this.refreshTrustedDevices();
+    await this.connectToBeacon(beacon);
+  }
+
+  async untrustDevice(deviceId: string): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    await this.trustStore.untrust(context, deviceId);
+    await this.refreshTrustedDevices();
   }
 
   async onPasteButtonClick(result: PasteButtonOnClickResult) {
     if (result !== PasteButtonOnClickResult.SUCCESS) {
-      this.lastReadStatus = `tap did not grant access (result: ${result})`;
+      this.lastSyncStatus = 'tap did not grant access - try again';
       return;
     }
     const change = await this.watcher.readCurrentClipboard();
     this.pendingChange = false;
     if (change === null) {
-      this.lastReadStatus = 'read OK, but content unchanged since last read (echo-suppressed)';
+      this.lastSyncStatus = 'clipboard unchanged since last sync';
       return;
     }
-    this.lastReadStatus = `read OK: ${change.type}`;
-    this.entries = [change, ...this.entries].slice(0, 50);
+    if (change.type === 'unsupported') {
+      this.lastSyncStatus = `unsupported clipboard content: ${change.detail}`;
+      return;
+    }
+    const identity = new DeviceIdentity();
+    const myDeviceId = await identity.getPublicKeyBase64();
+    const entry = await signEntry(identity, change.content, change.type, myDeviceId);
+    await this.syncManager?.broadcastEntry(entry);
+    const count = this.syncManager?.connectionCount ?? 0;
+    this.lastSyncStatus = count > 0
+      ? `synced ${change.type} to ${count} device(s)`
+      : `captured ${change.type} - no devices connected yet`;
   }
 
-  build() {
+  async runSelfTest() {
+    this.selfTestStatus = 'running...';
+    try {
+      const identity = new DeviceIdentity();
+      await identity.getPublicKeyBase64();
+      const testBytes = new Uint8Array([1, 2, 3]);
+      await identity.sign(testBytes);
+      const context = getContext(this) as common.UIAbilityContext;
+      await this.trustStore.isTrusted(context, 'self-test-probe');
+      this.selfTestStatus = 'PASSED - identity, signing, and trust store all working';
+    } catch (e) {
+      const be = e as BusinessError;
+      this.selfTestStatus = `FAILED: ${be.message ?? e}`;
+    }
+  }
+
+  private deviceRows(): DeviceRow[] {
+    const rows = new Map<string, DeviceRow>();
+    for (const t of this.trustedDevices) {
+      rows.set(t.publicKey, {
+        deviceId: t.publicKey,
+        address: t.address ?? null,
+        trusted: true,
+        discovered: false,
+        tcpPort: null,
+        connected: this.syncManager?.isConnected(t.publicKey) === true,
+      });
+    }
+    for (const b of this.receivedBeacons) {
+      if (b.deviceId === this.ownDeviceId) continue;
+      const existing = rows.get(b.deviceId);
+      if (existing) {
+        existing.discovered = true;
+        existing.tcpPort = b.tcpPort;
+        existing.address = b.senderIp;
+        existing.connected = this.syncManager?.isConnected(b.deviceId) === true;
+      } else {
+        rows.set(b.deviceId, {
+          deviceId: b.deviceId,
+          address: b.senderIp,
+          trusted: false,
+          discovered: true,
+          tcpPort: b.tcpPort,
+          connected: false,
+        });
+      }
+    }
+    return Array.from(rows.values());
+  }
+
+  private materialCard(): uiMaterial.ImmersiveMaterial {
+    return new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.THIN });
+  }
+
+  // Matches the official 沉浸光感 bottom-tab-bar sample's color convention
+  // (accent blue for the selected tab, gray for the rest) rather than the
+  // white-text guess from before, which was unreadable because it assumed
+  // the wrong background tone.
+  @Builder
+  tabBarItem(label: string, index: number) {
+    Column() {
+      Text(label)
+        .fontSize(13)
+        .fontWeight(this.currentTabIndex === index ? FontWeight.Bold : FontWeight.Medium)
+        .fontColor(this.currentTabIndex === index ? '#007DFF' : '#999999')
+    }
+    .justifyContent(FlexAlign.Center)
+    .width('100%')
+    .height('100%')
+  }
+
+  private typeBadgeColor(type: string): string {
+    if (type === 'text') return '#3B82F6';
+    if (type === 'image') return '#A855F7';
+    if (type === 'file') return '#F59E0B';
+    return '#6B7280';
+  }
+
+  @Builder
+  syncedItemCard(item: SyncedItem) {
+    Row({ space: 12 }) {
+      Text(item.type.slice(0, 1).toUpperCase())
+        .fontSize(14)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Color.White)
+        .width(32)
+        .height(32)
+        .textAlign(TextAlign.Center)
+        .backgroundColor(this.typeBadgeColor(item.type))
+        .borderRadius(16)
+
+      Column({ space: 3 }) {
+        Text(item.preview).fontSize(14).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text(`${item.source} · ${item.time}`).fontSize(11).fontColor('#888888')
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+    }
+    .width('100%')
+    .padding(12)
+    .borderRadius(14)
+    .systemMaterial(this.materialCard())
+    .alignItems(VerticalAlign.Center)
+  }
+
+  @Builder
+  syncedTab() {
+    List({ space: 10 }) {
+      ListItem() {
+        Column({ space: 8 }) {
+          Text(this.pendingChange ? 'Clipboard changed — tap to sync' : 'Clipboard up to date').fontSize(15).fontWeight(FontWeight.Medium)
+          PasteButton({ icon: PasteIconStyle.LINES, text: PasteDescription.PASTE, buttonType: ButtonType.Capsule })
+            .onClick((event: ClickEvent, result: PasteButtonOnClickResult) => { void this.onPasteButtonClick(result); })
+          if (this.lastSyncStatus.length > 0) {
+            Text(this.lastSyncStatus).fontSize(12).fontColor('#666666')
+          }
+        }
+        .width('100%')
+        .padding(16)
+        .borderRadius(16)
+        .systemMaterial(this.materialCard())
+        .alignItems(HorizontalAlign.Start)
+      }
+
+      if (this.syncedItems.length === 0) {
+        ListItem() {
+          Text('Nothing synced yet.').fontSize(12).fontColor('#999999').padding(12)
+        }
+      } else {
+        ForEach(this.syncedItems, (item: SyncedItem, index: number) => {
+          ListItem() { this.syncedItemCard(item) }
+        }, (item: SyncedItem) => item.id)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+    .edgeEffect(EdgeEffect.Spring)
+  }
+
+  @Builder
+  devicesTab() {
     Scroll() {
-      Column({ space: 16 }) {
-        Text('ClipLink — Step 4 diagnostics').fontSize(16).fontWeight(FontWeight.Bold)
-        Button('Run Step 4 Diagnostics').onClick(() => { void this.runStep4Diagnostics(); })
-        Text(`Status: ${this.step4Status}`)
-        Text(this.step4Detail).fontSize(11)
-
-        Divider()
-
-        Text('Clipboard Sync — Step 3').fontSize(20).fontWeight(FontWeight.Bold)
-        Text(
-          'HarmonyOS restricts clipboard reads to a tap-triggered temporary ' +
-          'grant for a normal app (see ClipboardWatcher.ets) — this can\'t ' +
-          'silently auto-pull like the Windows daemon does. Detecting a ' +
-          'change is free; tap Paste below to actually read it.'
-        ).fontSize(12).fontColor('#666666')
-
-        Divider()
-
-        Text(this.pendingChange ? 'Clipboard changed — tap to sync' : 'No pending change detected').fontSize(16).fontWeight(FontWeight.Bold)
-
-        PasteButton({ icon: PasteIconStyle.LINES, text: PasteDescription.PASTE, buttonType: ButtonType.Capsule })
-          .onClick((event: ClickEvent, result: PasteButtonOnClickResult) => {
-            void this.onPasteButtonClick(result);
-          })
-        Text(this.lastReadStatus).fontSize(12)
-
-        Divider()
-
-        Text(`Synced entries (${this.entries.length})`).fontSize(16).fontWeight(FontWeight.Bold)
-        ForEach(this.entries, (entry: ClipboardChange, index: number) => {
-          Column({ space: 4 }) {
-            Text(`#${this.entries.length - index} — ${entry.type}`).fontWeight(FontWeight.Bold)
-            if (entry.type === 'text') {
-              Text(entry.content).fontSize(12).maxLines(3)
-            } else if (entry.type === 'image') {
-              Text(`(image, ${entry.content.length} base64 chars)`).fontSize(12)
-            } else {
-              Text(`(unsupported: ${entry.detail})`).fontSize(12)
+      Column({ space: 8 }) {
+        Text(`${this.syncManager?.connectionCount ?? 0} device(s) connected`).fontSize(14).fontColor('#666666')
+        ForEach(this.deviceRows(), (row: DeviceRow) => {
+          Row({ space: 12 }) {
+            Column({ space: 2 }) {
+              Text(`${row.deviceId.slice(0, 24)}...`).fontSize(13).fontWeight(FontWeight.Medium)
+              Text(`${row.address ?? 'no known address'}${row.connected ? ' — connected' : row.trusted ? ' — trusted' : ' — discovered'}`)
+                .fontSize(11).fontColor(row.connected ? '#008800' : '#666666')
             }
-            if (entry.hash.length > 0) {
-              Text(`hash: ${entry.hash}`).fontSize(10)
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+
+            if (!row.trusted && row.discovered) {
+              Button('Trust').fontSize(12).onClick(() => {
+                const beacon = this.receivedBeacons.find(b => b.deviceId === row.deviceId);
+                if (beacon) void this.trustAndConnect(beacon);
+              })
+            } else if (row.trusted) {
+              Button('Remove').fontSize(12).onClick(() => { void this.untrustDevice(row.deviceId); })
             }
           }
-          .alignItems(HorizontalAlign.Start)
           .width('100%')
-          .padding(8)
-          .backgroundColor('#f2f2f2')
-          .borderRadius(6)
-        }, (entry: ClipboardChange, index: number) => `${index}-${entry.hash}`)
+          .padding(10)
+          .borderRadius(12)
+          .systemMaterial(this.materialCard())
+        }, (row: DeviceRow) => row.deviceId)
+
+        if (this.deviceRows().length === 0) {
+          Text('No devices yet. Trusted devices and nearby devices on the same network will show up here.')
+            .fontSize(12).fontColor('#999999')
+        }
       }
       .width('100%')
-      .padding(16)
+      .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
     .height('100%')
+    .edgeEffect(EdgeEffect.Spring)
+  }
+
+  @Builder
+  meTab() {
+    Scroll() {
+      Column({ space: 12 }) {
+        Column({ space: 4 }) {
+          Text('Your device ID').fontSize(13).fontColor('#666666')
+          Text(this.ownDeviceId).fontSize(11).copyOption(CopyOptions.LocalDevice)
+        }
+        .width('100%')
+        .padding(12)
+        .borderRadius(12)
+        .systemMaterial(this.materialCard())
+        .alignItems(HorizontalAlign.Start)
+
+        Column({ space: 6 }) {
+          Text('Diagnostics').fontSize(13).fontColor('#666666')
+          Button('Run Self-Test').fontSize(12).onClick(() => { void this.runSelfTest(); })
+          Text(this.selfTestStatus).fontSize(11).fontColor('#999999')
+          Text(`Immersive material supported: ${this.immersiveSupported}`).fontSize(11).fontColor('#999999')
+        }
+        .width('100%')
+        .padding(12)
+        .borderRadius(12)
+        .systemMaterial(this.materialCard())
+        .alignItems(HorizontalAlign.Start)
+      }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+      .alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .height('100%')
+    .edgeEffect(EdgeEffect.Spring)
+  }
+
+  build() {
+    // Matches the official API 26.0.0 barFloatingStyle sample (ts-container-tabs
+    // reference doc, "示例24 TabBar悬浮样式") as closely as possible, rather than
+    // the earlier guess-and-check version. Two things that guess got wrong:
+    // - barMode/barHeight/scrollable aren't part of the canonical sample at all
+    //   and aren't needed for a fixed 3-tab bar.
+    // - Tabs has defaulted expandSafeArea to
+    //   expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM]) since API 11.
+    //   Our old explicit .expandSafeArea([SafeAreaType.SYSTEM]) (no edge argument,
+    //   which expands ALL edges) plus a manually-computed barBottomMargin were
+    //   fighting that built-in behavior instead of relying on it - the likely
+    //   cause of both the missing pill material and the broken bottom safe area.
+    Tabs({ index: this.currentTabIndex, barPosition: BarPosition.End }) {
+      TabContent() { this.syncedTab() }
+        .tabBar(() => { this.tabBarItem('Synced', 0) })
+      TabContent() { this.devicesTab() }
+        .tabBar(() => { this.tabBarItem('Devices', 1) })
+      TabContent() { this.meTab() }
+        .tabBar(() => { this.tabBarItem('Me', 2) })
+    }
+    .barOverlap(true)
+    .barFloatingStyle({
+      adaptToHandedness: true,
+      systemMaterial: new uiMaterial.ImmersiveMaterial({
+        style: uiMaterial.ImmersiveStyle.THIN,
+        applyShadow: true,
+        interactive: true,
+        lightEffect: { color: Color.White },
+      }),
+    })
+    .width('100%')
+    .height('100%')
+    .onChange((index: number) => { this.currentTabIndex = index; })
   }
 }

@@ -1,0 +1,85 @@
+// Step 6 of the build order in ../../../../README.md: handshake + session
+// encryption. Matches PeerConnection.cs's Encrypt/Decrypt exactly: packed
+// = nonce(12) || tag(16) || ciphertext, base64-encoded, AES-256-GCM.
+//
+// GENUINE UNKNOWN going in: this SDK's Cipher interface has no getAuthTag()
+// method (unlike some blog examples referencing a different SDK version) -
+// GcmParamsSpec.authTag is a *required* field even in the type declaration.
+// Working hypothesis, to be confirmed by the self round-trip diagnostic:
+// doFinal() for ENCRYPT_MODE returns ciphertext with the tag appended
+// (ciphertext || tag), and authTag in the init() params is only meaningful
+// for DECRYPT_MODE (a placeholder value is passed at encrypt time since the
+// type requires *a* DataBlob regardless of mode).
+
+import { cryptoFramework } from '@kit.CryptoArchitectureKit';
+import { util } from '@kit.ArkTS';
+
+const NONCE_SIZE = 12;
+const TAG_SIZE = 16;
+
+const base64Helper = new util.Base64Helper();
+const decoder = util.TextDecoder.create('utf-8');
+
+function utf8Bytes(s: string): Uint8Array {
+  return new Uint8Array(Array.from(s).map(c => c.charCodeAt(0)));
+}
+
+function randomBytes(len: number): Uint8Array {
+  return cryptoFramework.createRandom().generateRandomSync(len).data;
+}
+
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, p) => sum + p.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const p of parts) {
+    out.set(p, offset);
+    offset += p.length;
+  }
+  return out;
+}
+
+export async function encrypt(sessionKey: Uint8Array, plaintext: string): Promise<string> {
+  const nonce = randomBytes(NONCE_SIZE);
+  const keyGen = cryptoFramework.createSymKeyGenerator('AES256');
+  const symKey = await keyGen.convertKey({ data: sessionKey });
+
+  const cipher = cryptoFramework.createCipher('AES256|GCM|NoPadding');
+  const params: cryptoFramework.GcmParamsSpec = {
+    algName: 'GcmParamsSpec',
+    iv: { data: nonce },
+    aad: { data: new Uint8Array(0) },
+    authTag: { data: new Uint8Array(TAG_SIZE) }, // placeholder - unused for encrypt, see file header
+  };
+  await cipher.init(cryptoFramework.CryptoMode.ENCRYPT_MODE, symKey, params);
+  const output = await cipher.doFinal({ data: utf8Bytes(plaintext) });
+
+  // Working hypothesis: output.data = ciphertext || tag (16 bytes at the end).
+  const outBytes = output.data;
+  const cipherBytes = outBytes.slice(0, outBytes.length - TAG_SIZE);
+  const tag = outBytes.slice(outBytes.length - TAG_SIZE);
+
+  const packed = concatBytes([nonce, tag, cipherBytes]);
+  return base64Helper.encodeToStringSync(packed);
+}
+
+export async function decrypt(sessionKey: Uint8Array, packedBase64: string): Promise<string> {
+  const packed = base64Helper.decodeSync(packedBase64);
+  const nonce = packed.slice(0, NONCE_SIZE);
+  const tag = packed.slice(NONCE_SIZE, NONCE_SIZE + TAG_SIZE);
+  const cipherBytes = packed.slice(NONCE_SIZE + TAG_SIZE);
+
+  const keyGen = cryptoFramework.createSymKeyGenerator('AES256');
+  const symKey = await keyGen.convertKey({ data: sessionKey });
+
+  const cipher = cryptoFramework.createCipher('AES256|GCM|NoPadding');
+  const params: cryptoFramework.GcmParamsSpec = {
+    algName: 'GcmParamsSpec',
+    iv: { data: nonce },
+    aad: { data: new Uint8Array(0) },
+    authTag: { data: tag },
+  };
+  await cipher.init(cryptoFramework.CryptoMode.DECRYPT_MODE, symKey, params);
+  const output = await cipher.doFinal({ data: cipherBytes });
+  return decoder.decodeToString(output.data);
+}

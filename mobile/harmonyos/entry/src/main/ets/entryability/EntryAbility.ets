@@ -22,6 +22,17 @@ export default class EntryAbility extends UIAbility {
     // Main window is created, set main page for this ability
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
 
+    // Immersive/edge-to-edge layout: content draws behind the status bar
+    // and navigation bar instead of the system reserving solid space for
+    // them (which otherwise shows as an unstyled black gap, since we never
+    // set a matching window background for that reserved area). Index.ets
+    // queries the actual avoid-area insets and pads its own content
+    // accordingly, rather than relying on the system's default insetting.
+    const mainWindow = windowStage.getMainWindowSync();
+    mainWindow.setWindowLayoutFullScreen(true).catch((err: Error) => {
+      hilog.error(DOMAIN, 'testTag', 'Failed to set full-screen layout. Cause: %{public}s', JSON.stringify(err));
+    });
+
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
         hilog.error(DOMAIN, 'testTag', 'Failed to load the content. Cause: %{public}s', JSON.stringify(err));

@@ -8,8 +8,9 @@
 // interoperable, even though signatures need EcdsaDer's conversion.
 
 import { huks } from '@kit.UniversalKeystoreKit';
+import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { util } from '@kit.ArkTS';
-import { derToRaw } from '../crypto/EcdsaDer';
+import { derToRaw, rawToDer } from '../crypto/EcdsaDer';
 
 const KEY_ALIAS = 'cliplink-identity';
 const base64Helper = new util.Base64Helper();
@@ -73,5 +74,32 @@ export class DeviceIdentity {
     await huks.updateSession(initResult.handle, { properties: props, inData: data });
     const finishResult = await huks.finishSession(initResult.handle, { properties: props });
     return finishResult.outData!;
+  }
+}
+
+// Verifies a raw 64-byte r||s signature (the wire format - see EcdsaDer.ets)
+// against a claimed peer's identity public key (base64 X.509 SPKI DER, same
+// format getPublicKeyBase64() produces). Standalone rather than a
+// DeviceIdentity method since it verifies an ARBITRARY peer's claimed key,
+// not this device's own HUKS-held one - matches SigningService.cs's
+// Verify(), which likewise imports the claimed signer's key ad hoc.
+export async function verifyRawSignature(peerPublicKeyBase64: string, data: Uint8Array, rawSignature: Uint8Array): Promise<boolean> {
+  const base64Helper = new util.Base64Helper();
+  let peerPublicKeyBytes: Uint8Array;
+  try {
+    peerPublicKeyBytes = base64Helper.decodeSync(peerPublicKeyBase64);
+  } catch (e) {
+    return false; // malformed base64 from a misbehaving/hostile peer
+  }
+
+  try {
+    const keyGen = cryptoFramework.createAsyKeyGenerator('ECC256');
+    const keyPair = await keyGen.convertKey({ data: peerPublicKeyBytes }, null);
+    const verifier = cryptoFramework.createVerify('ECC256|SHA256');
+    await verifier.init(keyPair.pubKey);
+    await verifier.update({ data });
+    return await verifier.verify(null, { data: rawToDer(rawSignature) });
+  } catch (e) {
+    return false; // malformed key/signature - treat as verification failure, not a crash
   }
 }
