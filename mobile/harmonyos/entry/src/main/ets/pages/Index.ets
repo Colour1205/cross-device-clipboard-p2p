@@ -95,7 +95,13 @@ function previewFor(entry: ClipboardEntry): string {
 // native long-press-to-select-a-range behavior on a Text component.
 @CustomDialog
 struct SelectTextDialog {
-  controller: CustomDialogController;
+  // Optional rather than a bare declaration: the framework injects this at
+  // construction time (see showSelectTextDialog below, which never passes
+  // it explicitly), but DevEco's Previewer linter
+  // (mandatory-default-value-for-local-initialization) doesn't know that
+  // and flags any non-optional field with no default - marking it optional
+  // is what its own "correct code" examples do for exactly this case.
+  controller?: CustomDialogController;
   content: string = '';
 
   build() {
@@ -106,7 +112,7 @@ struct SelectTextDialog {
       .width('100%')
       .constraintSize({ maxHeight: 320 })
 
-      Button('Close').fontSize(13).onClick(() => { this.controller.close(); })
+      Button('Close').fontSize(13).onClick(() => { this.controller?.close(); })
     }
     .width('100%')
     .padding(16)
