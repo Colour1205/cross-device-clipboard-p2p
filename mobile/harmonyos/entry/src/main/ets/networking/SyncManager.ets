@@ -25,6 +25,7 @@ export class SyncManager {
   private context: common.UIAbilityContext;
   private entryAppliedCallback: ((entry: ClipboardEntry, result: ApplyResult, fromPeer: boolean) => void) | null = null;
   private logCallback: ((message: string) => void) | null = null;
+  private connectionsChangedCallback: ((count: number) => void) | null = null;
 
   constructor(fileStore: FileStore, trustStore: TrustStore, context: common.UIAbilityContext) {
     this.history = new HistoryAccess(fileStore);
@@ -38,6 +39,16 @@ export class SyncManager {
 
   onLog(callback: (message: string) => void): void {
     this.logCallback = callback;
+  }
+
+  // The connections Map lives entirely inside this class - a plain
+  // JS Map's mutations aren't observable by ArkUI's @State reactivity, so
+  // without this callback the UI's connected-device count never updates
+  // even though connectionCount itself was always correct if you happened
+  // to re-read it. Fired on every add (registerConnection) and remove
+  // (peer disconnect).
+  onConnectionsChanged(callback: (count: number) => void): void {
+    this.connectionsChangedCallback = callback;
   }
 
   get connectionCount(): number {
@@ -54,9 +65,11 @@ export class SyncManager {
   // complete a handshake.
   registerConnection(conn: PeerConnection): void {
     this.connections.set(conn.peerDeviceId, conn);
+    this.connectionsChangedCallback?.(this.connections.size);
     conn.onMessage((msg: string) => { void this.handleMessage(msg); });
     conn.onDisconnected(() => {
       this.connections.delete(conn.peerDeviceId);
+      this.connectionsChangedCallback?.(this.connections.size);
       this.logCallback?.(`peer disconnected: ${conn.peerDeviceId.slice(0, 20)}...`);
     });
     conn.listen();

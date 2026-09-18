@@ -15,8 +15,9 @@
 
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { window } from '@kit.ArkUI';
+import { window, promptAction } from '@kit.ArkUI';
 import { scanBarcode } from '@kit.ScanKit';
+import pasteboard from '@ohos.pasteboard';
 import uiMaterial from '@ohos.arkui.uiMaterial';
 import { ClipboardWatcher } from '../clipboard/ClipboardWatcher';
 import { DeviceIdentity } from '../identity/DeviceIdentity';
@@ -59,6 +60,7 @@ interface SyncedItem {
   id: string;
   type: string;
   preview: string;
+  content: string; // full, untruncated - what "Copy content"/"Select text" act on
   source: string;
   time: string;
   fromPeer: boolean;
@@ -86,6 +88,31 @@ function previewFor(entry: ClipboardEntry): string {
   return entry.Content;
 }
 
+// Full-text view for the synced-item long-press menu's "Select text" option.
+// A dialog rather than making the list card's own Text selectable in place,
+// since the card only ever shows an 80-char preview - this shows the whole
+// content, and .copyOption(LocalDevice) is what actually turns on ArkUI's
+// native long-press-to-select-a-range behavior on a Text component.
+@CustomDialog
+struct SelectTextDialog {
+  controller: CustomDialogController;
+  content: string = '';
+
+  build() {
+    Column({ space: 12 }) {
+      Scroll() {
+        Text(this.content).fontSize(14).copyOption(CopyOptions.LocalDevice)
+      }
+      .width('100%')
+      .constraintSize({ maxHeight: 320 })
+
+      Button('Close').fontSize(13).onClick(() => { this.controller.close(); })
+    }
+    .width('100%')
+    .padding(16)
+  }
+}
+
 @Entry
 @Component
 struct Index {
@@ -93,18 +120,16 @@ struct Index {
   @State receivedBeacons: PeerBeacon[] = [];
   @State trustedDevices: TrustedDevice[] = [];
   @State pendingChange: boolean = false;
-  @State lastSyncStatus: string = '';
   @State syncLog: string[] = [];
   @State syncedItems: SyncedItem[] = [];
   @State immersiveSupported: boolean = false;
-  @State selfTestStatus: string = 'not run yet';
+  @State connectedCount: number = 0;
   @State topInsetVp: number = 0;
   @State bottomInsetVp: number = 0;
   @State currentTabIndex: number = 0;
   @State myPairingPayload: string = '';
   @State hasPassphrase: boolean = false;
   @State passphraseInput: string = '';
-  @State passphraseStatus: string = '';
   @State settingPassphrase: boolean = false;
   @State scanStatus: string = '';
 
@@ -145,6 +170,7 @@ struct Index {
         id: entry.Signature ?? `${entry.DeviceId}:${entry.Timestamp}`,
         type: entry.Type,
         preview: previewFor(entry),
+        content: entry.Content,
         source: entry.DeviceId === this.ownDeviceId ? 'This device' : `${entry.DeviceId.slice(0, 12)}...`,
         time: entry.Timestamp.slice(11, 16),
         fromPeer,
@@ -153,6 +179,13 @@ struct Index {
     });
     syncManager.onLog((message: string) => {
       this.syncLog = [message, ...this.syncLog].slice(0, 30);
+    });
+    // The connections Map lives inside SyncManager and isn't itself
+    // reactive - without this the Devices tab's connected-device count
+    // never updated after the first render even though the underlying
+    // count was always correct (see SyncManager.ets's onConnectionsChanged).
+    syncManager.onConnectionsChanged((count: number) => {
+      this.connectedCount = count;
     });
     this.syncManager = syncManager;
 
@@ -270,6 +303,7 @@ struct Index {
     // with Remove) - without this, tapping Remove on a device that's still
     // on the LAN looks like it silently did nothing.
     this.syncLog = [`untrusted ${deviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+    promptAction.showToast({ message: `Removed ${deviceId.slice(0, 12)}...` });
   }
 
   private async refreshPassphraseState(): Promise<void> {
@@ -289,7 +323,7 @@ struct Index {
     if (this.settingPassphrase) return; // already running - ignore a double-tap
     const passphrase = this.passphraseInput.trim();
     if (passphrase.length === 0) {
-      this.passphraseStatus = 'Enter a passcode first.';
+      promptAction.showToast({ message: 'Enter a passcode first.' });
       return;
     }
     // PassphraseKeyStore.setPassphrase runs PBKDF2 at 210,000 iterations
@@ -298,16 +332,15 @@ struct Index {
     // on-device. Without this pending state the button looked broken:
     // nothing visibly happened until it finally resolved.
     this.settingPassphrase = true;
-    this.passphraseStatus = 'Setting passcode... this can take a few seconds.';
     try {
       const context = getContext(this) as common.UIAbilityContext;
       await this.passphraseKeyStore.setPassphrase(context, passphrase);
       this.passphraseInput = '';
       await this.refreshPassphraseState();
-      this.passphraseStatus = 'Passcode set — other devices using the same passcode will auto-trust.';
+      promptAction.showToast({ message: 'Passcode set — matching devices will auto-trust.', duration: 3000 });
     } catch (e) {
       const be = e as BusinessError;
-      this.passphraseStatus = `Failed to set passcode: ${be.message ?? e}`;
+      promptAction.showToast({ message: `Failed to set passcode: ${be.message ?? e}`, duration: 3000 });
     } finally {
       this.settingPassphrase = false;
     }
@@ -377,17 +410,17 @@ struct Index {
 
   async onPasteButtonClick(result: PasteButtonOnClickResult) {
     if (result !== PasteButtonOnClickResult.SUCCESS) {
-      this.lastSyncStatus = 'tap did not grant access - try again';
+      promptAction.showToast({ message: 'Tap did not grant access — try again.' });
       return;
     }
     const change = await this.watcher.readCurrentClipboard();
     this.pendingChange = false;
     if (change === null) {
-      this.lastSyncStatus = 'clipboard unchanged since last sync';
+      promptAction.showToast({ message: 'Clipboard unchanged since last sync.' });
       return;
     }
     if (change.type === 'unsupported') {
-      this.lastSyncStatus = `unsupported clipboard content: ${change.detail}`;
+      promptAction.showToast({ message: `Unsupported clipboard content: ${change.detail}` });
       return;
     }
     const identity = new DeviceIdentity();
@@ -395,13 +428,12 @@ struct Index {
     const entry = await signEntry(identity, change.content, change.type, myDeviceId);
     await this.syncManager?.broadcastEntry(entry);
     const count = this.syncManager?.connectionCount ?? 0;
-    this.lastSyncStatus = count > 0
-      ? `synced ${change.type} to ${count} device(s)`
-      : `captured ${change.type} - no devices connected yet`;
+    promptAction.showToast({
+      message: count > 0 ? `Synced ${change.type} to ${count} device(s).` : `Captured ${change.type} — no devices connected yet.`,
+    });
   }
 
   async runSelfTest() {
-    this.selfTestStatus = 'running...';
     try {
       const identity = new DeviceIdentity();
       await identity.getPublicKeyBase64();
@@ -409,11 +441,26 @@ struct Index {
       await identity.sign(testBytes);
       const context = getContext(this) as common.UIAbilityContext;
       await this.trustStore.isTrusted(context, 'self-test-probe');
-      this.selfTestStatus = 'PASSED - identity, signing, and trust store all working';
+      promptAction.showToast({ message: 'Self-test passed — identity, signing, and trust store all working.' });
     } catch (e) {
       const be = e as BusinessError;
-      this.selfTestStatus = `FAILED: ${be.message ?? e}`;
+      promptAction.showToast({ message: `Self-test failed: ${be.message ?? e}` });
     }
+  }
+
+  copyItemContent(item: SyncedItem): void {
+    const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, item.content);
+    pasteboard.getSystemPasteboard().setData(data)
+      .then(() => { promptAction.showToast({ message: 'Copied to clipboard.' }); })
+      .catch(() => { promptAction.showToast({ message: 'Could not copy — try again.' }); });
+  }
+
+  showSelectTextDialog(item: SyncedItem): void {
+    const dialogController: CustomDialogController = new CustomDialogController({
+      builder: SelectTextDialog({ content: item.content }),
+      alignment: DialogAlignment.Bottom,
+    });
+    dialogController.open();
   }
 
   private deviceRows(): DeviceRow[] {
@@ -454,28 +501,22 @@ struct Index {
     return new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.THIN });
   }
 
-  // Matches the official 沉浸光感 bottom-tab-bar sample's color convention
-  // (accent blue for the selected tab, gray for the rest) rather than the
-  // white-text guess from before, which was unreadable because it assumed
-  // the wrong background tone.
-  @Builder
-  tabBarItem(label: string, index: number) {
-    Column() {
-      Text(label)
-        .fontSize(13)
-        .fontWeight(this.currentTabIndex === index ? FontWeight.Bold : FontWeight.Medium)
-        .fontColor(this.currentTabIndex === index ? '#007DFF' : '#999999')
-    }
-    .justifyContent(FlexAlign.Center)
-    .width('100%')
-    .height('100%')
-  }
-
   private typeBadgeColor(type: string): string {
     if (type === 'text') return '#3B82F6';
     if (type === 'image') return '#A855F7';
     if (type === 'file') return '#F59E0B';
     return '#6B7280';
+  }
+
+  // Long-press menu for a synced item - only meaningful for text entries
+  // (image/file content isn't copyable-as-text), wired onto the card via
+  // .bindContextMenu(..., ResponseType.LongPress) below.
+  @Builder
+  itemActionMenu(item: SyncedItem) {
+    Menu() {
+      MenuItem({ content: 'Copy content' }).onClick(() => { this.copyItemContent(item); })
+      MenuItem({ content: 'Select text' }).onClick(() => { this.showSelectTextDialog(item); })
+    }
   }
 
   @Builder
@@ -503,6 +544,7 @@ struct Index {
     .borderRadius(14)
     .systemMaterial(this.materialCard())
     .alignItems(VerticalAlign.Center)
+    .bindContextMenu(this.itemActionMenu(item), ResponseType.LongPress, { preview: MenuPreviewMode.NONE })
   }
 
   @Builder
@@ -513,9 +555,6 @@ struct Index {
           Text(this.pendingChange ? 'Clipboard changed — tap to sync' : 'Clipboard up to date').fontSize(15).fontWeight(FontWeight.Medium)
           PasteButton({ icon: PasteIconStyle.LINES, text: PasteDescription.PASTE, buttonType: ButtonType.Capsule })
             .onClick((event: ClickEvent, result: PasteButtonOnClickResult) => { void this.onPasteButtonClick(result); })
-          if (this.lastSyncStatus.length > 0) {
-            Text(this.lastSyncStatus).fontSize(12).fontColor('#666666')
-          }
         }
         .width('100%')
         .padding(16)
@@ -544,7 +583,7 @@ struct Index {
   devicesTab() {
     Scroll() {
       Column({ space: 8 }) {
-        Text(`${this.syncManager?.connectionCount ?? 0} device(s) connected`).fontSize(14).fontColor('#666666')
+        Text(`${this.connectedCount} device(s) connected`).fontSize(14).fontColor('#666666')
         ForEach(this.deviceRows(), (row: DeviceRow) => {
           Row({ space: 12 }) {
             Column({ space: 2 }) {
@@ -573,27 +612,6 @@ struct Index {
         if (this.deviceRows().length === 0) {
           Text('No devices yet. Trusted devices and nearby devices on the same network will show up here.')
             .fontSize(12).fontColor('#999999')
-        }
-
-        // syncLog is where every connect/disconnect/trust/untrust event
-        // already gets recorded (see e.g. untrustDevice, connectToBeacon) -
-        // it just had nowhere to be seen before, which made actions like
-        // "Remove" look like they silently did nothing even when they'd
-        // worked (a removed-but-still-beaconing device reappears here as
-        // "discovered" rather than disappearing, which reads the same way
-        // without this confirmation).
-        if (this.syncLog.length > 0) {
-          Column({ space: 4 }) {
-            Text('Recent activity').fontSize(13).fontColor('#666666')
-            ForEach(this.syncLog.slice(0, 8), (line: string, index: number) => {
-              Text(line).fontSize(11).fontColor('#999999')
-            }, (line: string, index: number) => `${index}-${line}`)
-          }
-          .width('100%')
-          .padding(10)
-          .borderRadius(12)
-          .systemMaterial(this.materialCard())
-          .alignItems(HorizontalAlign.Start)
         }
       }
       .width('100%')
@@ -662,9 +680,6 @@ struct Index {
               .enabled(!this.settingPassphrase)
               .onClick(() => { void this.setPassphrase(); })
           }
-          if (this.passphraseStatus.length > 0) {
-            Text(this.passphraseStatus).fontSize(11).fontColor('#666666')
-          }
         }
         .width('100%')
         .padding(12)
@@ -675,7 +690,6 @@ struct Index {
         Column({ space: 6 }) {
           Text('Diagnostics').fontSize(13).fontColor('#666666')
           Button('Run Self-Test').fontSize(12).onClick(() => { void this.runSelfTest(); })
-          Text(this.selfTestStatus).fontSize(11).fontColor('#999999')
           Text(`Immersive material supported: ${this.immersiveSupported}`).fontSize(11).fontColor('#999999')
         }
         .width('100%')
@@ -683,6 +697,23 @@ struct Index {
         .borderRadius(12)
         .systemMaterial(this.materialCard())
         .alignItems(HorizontalAlign.Start)
+
+        // Moved here from the Devices tab - syncLog is where every connect/
+        // disconnect/trust/untrust/auto-trust event gets recorded (see e.g.
+        // untrustDevice, connectToBeacon, maybeAutoTrustViaPassphrase).
+        if (this.syncLog.length > 0) {
+          Column({ space: 4 }) {
+            Text('Activity log').fontSize(13).fontColor('#666666')
+            ForEach(this.syncLog.slice(0, 12), (line: string, index: number) => {
+              Text(line).fontSize(11).fontColor('#999999')
+            }, (line: string, index: number) => `${index}-${line}`)
+          }
+          .width('100%')
+          .padding(12)
+          .borderRadius(12)
+          .systemMaterial(this.materialCard())
+          .alignItems(HorizontalAlign.Start)
+        }
       }
       .width('100%')
       .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
@@ -693,25 +724,40 @@ struct Index {
     .edgeEffect(EdgeEffect.Spring)
   }
 
+  // Root cause of the persistently-unreadable tab labels, found in Huawei's
+  // own "设置沉浸式系统材质反色" (immersive material color-invert) sample:
+  // colorInvert only auto-adjusts text/icon color for BottomTabBarStyle's
+  // labelStyle/iconStyle (which use color-invert-aware resource tokens like
+  // $r('sys.color.font_primary')) - it does NOT apply to an arbitrary
+  // custom @Builder's Text with a hardcoded hex fontColor, which is what
+  // every earlier attempt here used. Hardcoded hex can't be "inverted" by
+  // the material at all. Switching to the framework's own tab-bar-style
+  // class, with colorInvert: true on the material, is what actually makes
+  // this work per the sample.
+  tabBarStyle(text: string): BottomTabBarStyle {
+    return BottomTabBarStyle.of($r('sys.media.ohos_icon_mask_svg'), text)
+      .labelStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_primary') })
+      .iconStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_primary') });
+  }
+
   build() {
     // Matches the official API 26.0.0 barFloatingStyle sample (ts-container-tabs
-    // reference doc, "示例24 TabBar悬浮样式") as closely as possible, rather than
-    // the earlier guess-and-check version. Two things that guess got wrong:
+    // reference doc, "示例24 TabBar悬浮样式") as closely as possible. Two things
+    // an earlier guess-and-check pass got wrong:
     // - barMode/barHeight/scrollable aren't part of the canonical sample at all
     //   and aren't needed for a fixed 3-tab bar.
     // - Tabs has defaulted expandSafeArea to
     //   expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM]) since API 11.
-    //   Our old explicit .expandSafeArea([SafeAreaType.SYSTEM]) (no edge argument,
+    //   An explicit .expandSafeArea([SafeAreaType.SYSTEM]) (no edge argument,
     //   which expands ALL edges) plus a manually-computed barBottomMargin were
-    //   fighting that built-in behavior instead of relying on it - the likely
-    //   cause of both the missing pill material and the broken bottom safe area.
+    //   fighting that built-in behavior instead of relying on it.
     Tabs({ index: this.currentTabIndex, barPosition: BarPosition.End }) {
       TabContent() { this.syncedTab() }
-        .tabBar(() => { this.tabBarItem('Synced', 0) })
+        .tabBar(this.tabBarStyle('Synced'))
       TabContent() { this.devicesTab() }
-        .tabBar(() => { this.tabBarItem('Devices', 1) })
+        .tabBar(this.tabBarStyle('Devices'))
       TabContent() { this.meTab() }
-        .tabBar(() => { this.tabBarItem('Me', 2) })
+        .tabBar(this.tabBarStyle('Me'))
     }
     .barOverlap(true)
     .barFloatingStyle({
@@ -721,6 +767,9 @@ struct Index {
         applyShadow: true,
         interactive: true,
         lightEffect: { color: Color.White },
+        // Needs THIN or ULTRA_THIN to take effect (see doc comment above) -
+        // THIN is already what we use, so this was a one-line gap the whole time.
+        colorInvert: true,
       }),
     })
     .width('100%')
