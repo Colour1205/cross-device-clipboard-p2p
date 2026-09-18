@@ -19,6 +19,17 @@ class Program
     {
         public ConcurrentDictionary<string, FileStream> InProgressWrites = new();
         public ConcurrentDictionary<string, ClipboardEntry> PendingEntries = new();
+        // Guards against streaming the same file to the same peer twice at
+        // once: ClipboardChanged proactively streams a freshly-captured
+        // file right after broadcasting its entry, but the receiving side
+        // (HandleIncomingFileEntry) also unconditionally broadcasts a
+        // file_request the moment it sees an entry it doesn't have bytes
+        // for yet, regardless of whether the sender is already streaming.
+        // Without this guard that redundant request starts a SECOND
+        // concurrent stream over the same connection, and the two chunk
+        // sequences interleave on the wire - the actual cause of "file
+        // transfer failed hash verification" on the receiving end.
+        public ConcurrentDictionary<string, byte> StreamingInFlight = new();
     }
 
     private static void HandleMessage(
@@ -48,9 +59,10 @@ class Program
             }
             if (!SigningService.Verify(entry, entry.DeviceId) || !trustStore.IsTrusted(entry.DeviceId))
             {
-                Console.WriteLine("Received message with invalid signature from peer.");
+                Console.WriteLine($"Received {entry.Type} message with invalid signature from peer (verified={SigningService.Verify(entry, entry.DeviceId)}, trusted={trustStore.IsTrusted(entry.DeviceId)}).");
                 return;
             }
+            Console.WriteLine($"[clip] received {entry.Type} entry from {entry.DeviceId[..Math.Min(12, entry.DeviceId.Length)]}... - applying");
 
             if (entry.Type == "file")
             {
@@ -99,7 +111,7 @@ class Program
         }
         else if (envelope.Type == "file_request")
         {
-            HandleFileRequest(envelope.Payload, fileStore, conn);
+            HandleFileRequest(envelope.Payload, fileStore, conn, fileTransferState);
         }
         else
         {
@@ -153,7 +165,7 @@ class Program
         }
     }
 
-    private static void HandleFileRequest(string payloadJson, FileStore fileStore, PeerConnection requestingConn)
+    private static void HandleFileRequest(string payloadJson, FileStore fileStore, PeerConnection requestingConn, FileTransferState fileTransferState)
     {
         FileRequestMessage? request;
         try
@@ -165,7 +177,12 @@ class Program
 
         if (fileStore.Exists(request.FileHash))
         {
-            _ = StreamFileToPeer(requestingConn, fileStore.GetPath(request.FileHash), request.FileHash);
+            Console.WriteLine($"[file] {requestingConn.PeerDeviceId[..Math.Min(12, requestingConn.PeerDeviceId.Length)]}... requested {request.FileHash[..12]}... - we have it, streaming");
+            _ = StreamFileToPeer(requestingConn, fileStore.GetPath(request.FileHash), request.FileHash, fileTransferState);
+        }
+        else
+        {
+            Console.WriteLine($"[file] {requestingConn.PeerDeviceId[..Math.Min(12, requestingConn.PeerDeviceId.Length)]}... requested {request.FileHash[..12]}... - don't have it, ignoring");
         }
         // if we don't have it either, just don't respond — the requester
         // already broadcast to everyone else too; someone else might have it
@@ -192,6 +209,11 @@ class Program
         }
         catch (FormatException) { return; }
 
+        bool isNewTransfer = !fileTransferState.InProgressWrites.ContainsKey(chunk.FileHash);
+        if (isNewTransfer)
+        {
+            Console.WriteLine($"[file] receiving {chunk.FileHash[..12]}...");
+        }
         var stream = fileTransferState.InProgressWrites.GetOrAdd(chunk.FileHash, _ =>
             new FileStream(fileStore.GetTempPath(chunk.FileHash), FileMode.Create, FileAccess.Write));
 
@@ -220,7 +242,7 @@ class Program
             actualHash = Convert.ToHexString(SHA256.HashData(verifyStream));
         }
 
-        if (actualHash != chunk.FileHash)
+        if (!string.Equals(actualHash, chunk.FileHash, StringComparison.OrdinalIgnoreCase))
         {
             // corrupted in transit, or tampered — the signed entry's hash is
             // what we trust, not whatever bytes actually showed up
@@ -231,6 +253,7 @@ class Program
         }
 
         File.Move(tempPath, fileStore.GetPath(chunk.FileHash), overwrite: true);
+        Console.WriteLine($"[file] received {chunk.FileHash[..12]}... - verified, saved");
         TryFulfillPendingEntry(chunk.FileHash, fileTransferState, clipboardSync);
     }
 
@@ -253,9 +276,18 @@ class Program
     // Reads a file incrementally and sends it as a sequence of file_chunk
     // envelopes — bounded memory (one chunk at a time) regardless of the
     // file's total size, unlike embedding the whole thing in one message.
-    private static async Task StreamFileToPeer(PeerConnection conn, string filePath, string fileHash)
+    private static async Task StreamFileToPeer(PeerConnection conn, string filePath, string fileHash, FileTransferState fileTransferState)
     {
+        string key = $"{conn.PeerDeviceId}:{fileHash}";
+        if (!fileTransferState.StreamingInFlight.TryAdd(key, 0))
+        {
+            // Already streaming this exact file to this exact peer - see
+            // StreamingInFlight's field comment.
+            return;
+        }
         const int chunkSize = 256 * 1024;
+        string shortPeer = conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)];
+        Console.WriteLine($"[file] sending {fileHash[..12]}... to {shortPeer}...");
         try
         {
             using var stream = File.OpenRead(filePath);
@@ -271,12 +303,36 @@ class Program
                 await conn.Send(JsonSerializer.Serialize(envelope));
                 chunkIndex++;
             }
+            Console.WriteLine($"[file] finished sending {fileHash[..12]}... to {shortPeer}... ({chunkIndex} chunks)");
         }
-        catch (Exception)
+        catch (Exception ex)
         {
             // peer disconnected mid-transfer, or the source file became
-            // unreadable — nothing further to do about it
+            // unreadable — nothing further to do about it, but worth logging
+            // since this used to fail completely silently
+            Console.WriteLine($"[file] sending {fileHash[..12]}... to {shortPeer}... failed: {ex.Message}");
         }
+        finally
+        {
+            fileTransferState.StreamingInFlight.TryRemove(key, out _);
+        }
+    }
+
+    // Without this, a connection that's been idle for a while (this app
+    // only sends when the clipboard actually changes, so idle is the common
+    // case) can get silently dropped by an intermediate NAT or firewall
+    // along the path - especially plausible over Tailscale/WireGuard, where
+    // the "connection" is really just a NAT mapping that times out without
+    // periodic traffic. TCP keepalive pings keep that mapping (and any
+    // stateful firewall's idea of the connection) alive without needing
+    // real application data to flow. Cross-platform since .NET 5 - not a
+    // Windows-only trick despite this being the Windows daemon.
+    private static void EnableKeepAlive(TcpClient client)
+    {
+        client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+        client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 20);
+        client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 10);
+        client.Client.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 5);
     }
 
     private static void SendHistoryBatch(PeerConnection conn, HistoryAccess historyAccess)
@@ -287,14 +343,93 @@ class Program
         _ = conn.Send(json);
     }
 
+    // Wires up a connection for actual use - history sync, message
+    // handling, disconnect cleanup. Shared by every path that ends up with
+    // a live, already-trusted connection (reconnects, the TCP accept loop,
+    // and accept_pairing once the user approves a candidate).
+    private static void RegisterConnection(
+        PeerConnection conn,
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
+        ClipboardSync clipboardSync,
+        HistoryAccess historyAccess,
+        TrustStore trustStore,
+        FileStore fileStore,
+        FileTransferState fileTransferState)
+    {
+        connectionsByDeviceId[conn.PeerDeviceId] = conn;
+        Console.WriteLine($"[conn] connected: {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}... ({connectionsByDeviceId.Count} total)");
+        SendHistoryBatch(conn, historyAccess);
+        conn.MessageReceived += msg => HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+        conn.Disconnected += () =>
+        {
+            connectionsByDeviceId.TryRemove(conn.PeerDeviceId, out _);
+            Console.WriteLine($"[conn] disconnected: {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}... ({connectionsByDeviceId.Count} total)");
+        };
+        _ = conn.Listen();
+    }
+
+    // Single funnel for every freshly-created PeerConnection, whichever of
+    // the several places created it. An already-trusted peer is registered
+    // immediately like always; one newly trusted via a matching passphrase
+    // proof (NewlyTrustedViaPassphrase - see PeerConnection.CreateAsync) is
+    // persisted to the trust store first, then registered the same way; a
+    // genuine pairing candidate (only possible because PairingState.ModeOpen
+    // was true) is parked as the pending candidate instead, for the tray's
+    // accept_pairing/reject_pairing IPC commands to resolve. Never
+    // auto-trusted just because a connection formed on its own.
+    private static void HandleNewConnection(
+        PeerConnection conn,
+        string? address,
+        PairingState pairingState,
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
+        ClipboardSync clipboardSync,
+        HistoryAccess historyAccess,
+        TrustStore trustStore,
+        FileStore fileStore,
+        FileTransferState fileTransferState)
+    {
+        if (conn.WasAlreadyTrusted)
+        {
+            if (conn.NewlyTrustedViaPassphrase)
+            {
+                Console.WriteLine($"Auto-pairing {conn.PeerDeviceId} — matching passphrase proof in handshake");
+                trustStore.Trust(conn.PeerDeviceId, address);
+            }
+            else if (address != null)
+            {
+                // Already trusted, but now we know a real address for this
+                // peer (e.g. captured off an incoming connection whose
+                // remote endpoint we just read, or a fresh dial) - back-fill
+                // it. Trust() upserts the address on an existing entry, so
+                // this is what actually fixes a trust record that was
+                // written back when the accept loop didn't capture an
+                // address at all (an old bug - it always passed null),
+                // instead of leaving it permanently stuck with no address
+                // to reconnect off-LAN with.
+                trustStore.Trust(conn.PeerDeviceId, address);
+            }
+            RegisterConnection(conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+            return;
+        }
+        if (!pairingState.TrySetPending(conn, address))
+        {
+            conn.Close(); // already have a candidate awaiting a decision
+        }
+    }
+
     // Dials out to a peer at a known address and wires it up exactly the same
     // way regardless of how that address was found — LAN discovery or a
-    // cached off-LAN (Tailscale) address from the trust store.
+    // cached off-LAN (Tailscale) address from the trust store. Only ever
+    // used for peers we already expect to be trusted (the id we dial is
+    // exactly the id we require back) - PairByAddress below is the
+    // counterpart for a genuinely new, not-yet-identified pairing target.
     private static async Task ConnectToPeer(
         string peerDeviceId,
         string address,
         int port,
         DeviceIdentity myIdentity,
+        PairingState pairingState,
+        PassphraseKeyStore passphraseKeyStore,
         ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
         ClipboardSync clipboardSync,
         HistoryAccess historyAccess,
@@ -305,8 +440,9 @@ class Program
     {
         TcpClient client = new TcpClient();
         await client.ConnectAsync(address, port, cancellationToken);
+        EnableKeepAlive(client);
 
-        var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore);
+        var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore, pairingState.ModeOpen, passphraseKeyStore);
         if (conn == null)
         {
             client.Close();
@@ -320,12 +456,47 @@ class Program
             throw new IOException("Connected peer's identity did not match the expected device id");
         }
 
-        connectionsByDeviceId[peerDeviceId] = conn;
-        SendHistoryBatch(conn, historyAccess);
+        HandleNewConnection(conn, address, pairingState, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+    }
 
-        conn.MessageReceived += msg => HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
-        conn.Disconnected += () => connectionsByDeviceId.TryRemove(peerDeviceId, out _);
-        _ = conn.Listen();
+    // Counterpart to ConnectToPeer for a genuinely new pairing target - the
+    // peer's identity isn't known in advance (that's what the handshake is
+    // for), so there's no id to validate against. Used by the "pair_by_address"
+    // IPC command and by the beacon handler's untrusted-pairing-candidate path.
+    // Returns whether a connection was actually established (not whether
+    // pairing succeeded - a candidate still counts as "connected", the
+    // accept/reject decision happens separately via HandleNewConnection).
+    private static async Task<bool> PairByAddress(
+        string address,
+        int port,
+        DeviceIdentity myIdentity,
+        PairingState pairingState,
+        PassphraseKeyStore passphraseKeyStore,
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
+        ClipboardSync clipboardSync,
+        HistoryAccess historyAccess,
+        TrustStore trustStore,
+        FileStore fileStore,
+        FileTransferState fileTransferState)
+    {
+        try
+        {
+            TcpClient client = new TcpClient();
+            await client.ConnectAsync(address, port);
+            EnableKeepAlive(client);
+            var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore, pairingState.ModeOpen, passphraseKeyStore);
+            if (conn == null)
+            {
+                client.Close();
+                return false;
+            }
+            HandleNewConnection(conn, address, pairingState, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false; // not reachable right now
+        }
     }
     [STAThread]
     static async Task Main(String[] args)
@@ -340,6 +511,13 @@ class Program
         TrustStore trustStore = new TrustStore(label);
         var passphraseKeyStore = new PassphraseKeyStore(label);
         var fileTransferState = new FileTransferState();
+        var pairingState = new PairingState();
+        // Constructed here (rather than down by clipboardSync.ClipboardChanged's
+        // registration, where it conceptually belongs) purely so the IPC handler
+        // block below - which needs it for accept_pairing/pair_by_address - can
+        // reference it; C# requires a local's declaration to textually precede
+        // any lambda that captures it, even though this one won't run until later.
+        var clipboardSync = new ClipboardSync(fileStore);
         Console.WriteLine($"Device ID (public key): {identity.GetPublicKey()}");
 
         if (trustedKeyToAdd != null)
@@ -416,6 +594,62 @@ class Program
                 }
                 return new IpcResponse(true, "untrusted");
             }
+            else if (request.Command == "set_pairing_mode" && request.Payload != null)
+            {
+                // Driven by the tray's Pairing dialog opening/closing - mirrors
+                // HarmonyOS's Index.ets pairingOpen. Only while this is true does
+                // PeerConnection.CreateAsync accept a handshake from an untrusted
+                // peer at all (see its own doc comment).
+                pairingState.ModeOpen = request.Payload == "1";
+                return new IpcResponse(true, pairingState.ModeOpen.ToString());
+            }
+            else if (request.Command == "get_pending_pairing")
+            {
+                // Polled by the tray while its Pairing dialog is open - there's no
+                // push channel from daemon to tray over this IPC transport, so the
+                // dialog just asks every second or so. Empty string means nothing
+                // pending.
+                return new IpcResponse(true, pairingState.PendingPeerId ?? "");
+            }
+            else if (request.Command == "accept_pairing")
+            {
+                var taken = pairingState.TakePending();
+                if (taken == null)
+                {
+                    return new IpcResponse(false, "nothing pending");
+                }
+                trustStore.Trust(taken.Value.conn.PeerDeviceId, taken.Value.address);
+                RegisterConnection(taken.Value.conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+                return new IpcResponse(true, "paired");
+            }
+            else if (request.Command == "reject_pairing")
+            {
+                pairingState.RejectPending();
+                return new IpcResponse(true, "rejected");
+            }
+            else if (request.Command == "pair_by_address" && request.Payload != null)
+            {
+                // Windows has no camera to scan a QR with, so this is the
+                // primary way to pair from here - type/paste an address (or the
+                // full {PublicKey,Address} pairing JSON copied from the other
+                // device; only Address is actually used, since the peer's real
+                // identity comes from the signature-verified handshake, not
+                // from anything typed here). Fire-and-forget: the tray polls
+                // get_pending_pairing for the result rather than blocking this
+                // IPC round-trip on a network connect attempt.
+                string address = request.Payload;
+                try
+                {
+                    var parsed = JsonSerializer.Deserialize<PairingInfo>(request.Payload);
+                    if (parsed != null && !string.IsNullOrWhiteSpace(parsed.Address))
+                    {
+                        address = parsed.Address;
+                    }
+                }
+                catch (JsonException) { /* not JSON - treat the raw input as a bare address */ }
+                _ = PairByAddress(address, int.Parse(port), identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+                return new IpcResponse(true, "connecting");
+            }
             else
             {
                 return new IpcResponse(false, "unknown command");
@@ -424,16 +658,23 @@ class Program
         _ = Task.Run(() => ipcServer.Start());
 
         // clipboard watcher
-        var clipboardSync = new ClipboardSync(fileStore);
         clipboardSync.ClipboardChanged += content =>
         {
+            Console.WriteLine($"[clip] detected local {content.type} change ({content.content.Length} chars/bytes-base64) - {connectionsByDeviceId.Count} peer(s) connected");
             var entry = new ClipboardEntry(content.content, content.type, identity.GetPublicKey(), DateTime.UtcNow);
             var signedEntry = SigningService.Sign(entry, identity);
             var envelope = new Envelope("entry", JsonSerializer.Serialize(signedEntry));
             var json = JsonSerializer.Serialize(envelope);
             foreach (var conn in connectionsByDeviceId.Values)
             {
-                _ = conn.Send(json);
+                string peerShort = conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)];
+                _ = conn.Send(json).ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        Console.WriteLine($"[clip] failed sending {content.type} entry to {peerShort}...: {t.Exception?.GetBaseException().Message}");
+                    }
+                }, TaskContinuationOptions.OnlyOnFaulted);
             }
             historyAccess.addToHistory(signedEntry);
 
@@ -445,6 +686,7 @@ class Program
 
                 if (payload != null)
                 {
+                    Console.WriteLine($"[file] copied: {payload.FileName} ({payload.FileSize} bytes, {payload.FileHash[..12]}...) - {connectionsByDeviceId.Count} peer(s) connected");
                     if (!fileStore.Exists(payload.FileHash))
                     {
                         try
@@ -460,7 +702,7 @@ class Program
                     {
                         foreach (var conn in connectionsByDeviceId.Values)
                         {
-                            _ = StreamFileToPeer(conn, fileStore.GetPath(payload.FileHash), payload.FileHash);
+                            _ = StreamFileToPeer(conn, fileStore.GetPath(payload.FileHash), payload.FileHash, fileTransferState);
                         }
                         // this exact content might already be something we were
                         // waiting on from a peer (e.g. this device independently
@@ -493,22 +735,25 @@ class Program
             while (true)
             {
                 var client = await tcpListener.AcceptTcpClientAsync();
+                EnableKeepAlive(client);
+                // Without capturing this, a device that only ever DIALED OUT
+                // to pair (rather than being dialed) would never learn an
+                // address for whoever just connected to it - meaning it could
+                // never later reconnect off-LAN on its own (see the off-LAN
+                // reconnect loop below), only ever be reconnected TO.
+                string? remoteAddress = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString();
 
-                var conn = await PeerConnection.CreateAsync(client, identity, trustStore);
+                var conn = await PeerConnection.CreateAsync(client, identity, trustStore, pairingState.ModeOpen, passphraseKeyStore);
                 if (conn == null)
                 {
                     // handshake failed, or whoever connected isn't in our trust
-                    // store — refuse at the connection level, not just per-message
+                    // store and we're not expecting to pair right now — refuse at
+                    // the connection level, not just per-message
                     client.Close();
                     continue;
                 }
 
-                connectionsByDeviceId[conn.PeerDeviceId] = conn;
-                SendHistoryBatch(conn, historyAccess);
-
-                conn.MessageReceived += msg => HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
-                conn.Disconnected += () => connectionsByDeviceId.TryRemove(conn.PeerDeviceId, out _);
-                _ = conn.Listen();
+                HandleNewConnection(conn, remoteAddress, pairingState, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
             }
 
         });
@@ -518,7 +763,7 @@ class Program
 
         Discovery discovery = new Discovery();
 
-        discovery.PeerDiscovered += async (other_device_id, sender, other_port, proof, peerAddress) =>
+        discovery.PeerDiscovered += async (other_device_id, sender, other_port, proof, peerAddress, otherPairingOpen) =>
         {
             // auto-trust: if this device wasn't already trusted, but it proved
             // knowledge of the same passphrase we have configured, trust it now —
@@ -533,20 +778,37 @@ class Program
                 trustStore.Trust(other_device_id, peerAddress);
             }
 
+            bool isTrusted = trustStore.IsTrusted(other_device_id);
+
             // connect only when the other device's public key is "smaller" than this device's public key (to avoid duplicate connections)
             // connect only if the other device is in the trust store
             if (!connectionsByDeviceId.ContainsKey(other_device_id) && other_device_id.CompareTo(identity.GetPublicKey()) < 0
-            && trustStore.IsTrusted(other_device_id))
+            && isTrusted)
             {
                 Console.WriteLine($"Discovered peer {other_device_id} at {other_port}");
                 try
                 {
-                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
                 }
                 catch (Exception)
                 {
                     // peer wasn't actually reachable — ignore, we'll hear its next beacon
                 }
+            }
+            // Sibling path for UNTRUSTED peers - only attempts a handshake at
+            // all when BOTH this device's own pairing mode is open
+            // (pairingState.ModeOpen) AND the beacon says the sender's is too
+            // (otherPairingOpen) - two independent, live, local "I'm expecting
+            // to pair right now" signals, not just one side's assumption. Same
+            // tie-breaker as above so both sides don't dial each other
+            // simultaneously; the handshake that results is what actually
+            // surfaces the accept/reject prompt (see HandleNewConnection).
+            else if (pairingState.ModeOpen && otherPairingOpen && !isTrusted
+                && !connectionsByDeviceId.ContainsKey(other_device_id) && other_device_id.CompareTo(identity.GetPublicKey()) < 0
+                && pairingState.PendingPeerId == null)
+            {
+                Console.WriteLine($"Discovered pairing candidate {other_device_id} at {other_port}");
+                await PairByAddress(sender.ToString(), other_port, identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
             }
 
         };
@@ -566,7 +828,7 @@ class Program
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                         try
                         {
-                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), identity, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState, cts.Token);
+                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState, cts.Token);
                         }
                         catch (Exception)
                         {
@@ -585,6 +847,7 @@ class Program
             passphraseKeyStore.HasPassphrase
                 ? PassphraseAuth.ComputeProof(passphraseKeyStore.GetKey()!, identity.GetPublicKey())
                 : null,
-            ownTailscaleAddress);
+            ownTailscaleAddress,
+            () => pairingState.ModeOpen);
     }
 }

@@ -9,16 +9,11 @@ import { preferences } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
 import { ClipboardEntry } from '../crypto/Signing';
 import { FileStore } from './FileStore';
+import { FilePayload } from './FilePayload';
 
 const PREFERENCES_NAME = 'cliplink_history';
 const HISTORY_KEY = 'entries';
 const MAX_HISTORY_ITEMS = 25;
-
-interface FilePayload {
-  FileName: string;
-  FileHash: string;
-  FileSize: number;
-}
 
 export class HistoryAccess {
   private fileStore: FileStore;

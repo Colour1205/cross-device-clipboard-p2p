@@ -31,8 +31,16 @@ const KEY_LEN_BYTES = 32;
 
 const base64Helper = new util.Base64Helper();
 
+// See crypto/Signing.ets's stringToBytes for the full explanation - this
+// was the same bug (truncating UTF-16 code units into single bytes instead
+// of real UTF-8 encoding). Here it meant a passphrase containing any
+// non-ASCII character (accented letters, emoji, etc.) derived a different
+// key on this device than Encoding.UTF8.GetBytes would derive on Windows
+// from the identical passphrase, breaking cross-device passphrase
+// auto-trust for anyone whose passcode wasn't pure ASCII.
+const textEncoder = util.TextEncoder.create('utf-8');
 function stringToBytes(s: string): Uint8Array {
-  return new Uint8Array(Array.from(s).map(c => c.charCodeAt(0)));
+  return textEncoder.encodeInto(s);
 }
 
 // Same intent as CryptographicOperations.FixedTimeEquals on the Windows

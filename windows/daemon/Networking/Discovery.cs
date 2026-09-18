@@ -25,7 +25,13 @@ public class Discovery
     // ownAddress is this device's off-LAN (Tailscale) address, if any — carried
     // so passphrase auto-trust can cache it too, same as QR/manual pairing does,
     // so passphrase-paired devices still get found later when off-LAN.
-    public async Task Start(string deviceID, int tcpPort, Func<string?>? getProof = null, string? ownAddress = null)
+    //
+    // getPairingOpen (fresh on every beacon, same reasoning as getProof) is
+    // the sender's own "my pairing dialog is open" signal - see PairingState.
+    // A receiver only attempts a pairing handshake with an untrusted device
+    // whose beacon carries this, instead of trying one with every stranger's
+    // beacon on the LAN.
+    public async Task Start(string deviceID, int tcpPort, Func<string?>? getProof = null, string? ownAddress = null, Func<bool>? getPairingOpen = null)
     {
         UdpClient client = new UdpClient();
         client.EnableBroadcast = true;
@@ -37,7 +43,8 @@ public class Discovery
             while (true)
             {
                 string? proof = getProof?.Invoke();
-                await Send(client, $"{tcpPort}:{deviceID}:{proof ?? "-"}:{ownAddress ?? "-"}");
+                string pairing = (getPairingOpen?.Invoke() ?? false) ? "1" : "-";
+                await Send(client, $"{tcpPort}:{deviceID}:{proof ?? "-"}:{ownAddress ?? "-"}:{pairing}");
                 await Task.Delay(2000);
             }
         });
@@ -56,15 +63,16 @@ public class Discovery
                 string other_device_id = parts[1];
                 string? receivedProof = parts[2] == "-" ? null : parts[2];
                 string? receivedAddress = parts.Length > 3 && parts[3] != "-" ? parts[3] : null;
+                bool receivedPairing = parts.Length > 4 && parts[4] == "1";
 
-                PeerDiscovered?.Invoke(other_device_id, sender, other_port, receivedProof, receivedAddress);
+                PeerDiscovered?.Invoke(other_device_id, sender, other_port, receivedProof, receivedAddress, receivedPairing);
             }
         });
 
         await Task.WhenAll(sendTask, receiveTask);
     }
 
-    public event Action<string, IPAddress, int, string?, string?>? PeerDiscovered;
+    public event Action<string, IPAddress, int, string?, string?, bool>? PeerDiscovered;
 
     private async Task Send(UdpClient client, string message)
     {

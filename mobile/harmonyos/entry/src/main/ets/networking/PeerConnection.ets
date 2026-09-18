@@ -13,6 +13,7 @@ import { util } from '@kit.ArkTS';
 import { common } from '@kit.AbilityKit';
 import { DeviceIdentity, verifyRawSignature } from '../identity/DeviceIdentity';
 import { TrustStore } from '../identity/TrustStore';
+import { PassphraseKeyStore } from '../identity/PassphraseKeyStore';
 import * as AesGcm from '../crypto/AesGcm';
 
 const base64Helper = new util.Base64Helper();
@@ -22,6 +23,13 @@ interface HandshakeMessage {
   EphemeralPublicKey: string;
   IdentityPublicKey: string;
   Signature: string;
+  // Optional - HMAC-SHA256(sharedPassphraseKey, own IdentityPublicKey),
+  // same computation as the LAN beacon's own proof (PassphraseAuth.cs).
+  // Lets two devices with the same passcode auto-accept a pairing over a
+  // direct connection (e.g. Tailscale, via Pair by Address) the same way
+  // they already auto-trust from a LAN beacon - no beacon needed, since
+  // this rides along on the handshake itself instead.
+  PassphraseProof?: string;
 }
 
 // Both socket.TCPSocket (outbound, from connectTcp) and
@@ -98,6 +106,14 @@ class TcpLineChannel {
   private pendingLines: string[] = [];
   private waiters: Array<(line: string | null) => void> = [];
   private closed = false;
+  // Chains every writeLine onto the previous one so only one client.send()
+  // is ever in flight at a time - without this, the heartbeat's own
+  // writeLine (see PeerConnection's heartbeat) can overlap a real one from
+  // SyncManager/file streaming, and there's no guarantee the underlying
+  // socket API handles two concurrent send() calls as cleanly-ordered,
+  // un-corrupted writes. Mirrors the same fix on the Windows side
+  // (PeerConnection.cs's writeLock), same reasoning.
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(client: TcpLike) {
     this.client = client;
@@ -154,7 +170,13 @@ class TcpLineChannel {
   }
 
   async writeLine(line: string): Promise<void> {
-    await this.client.send({ data: line + '\n' });
+    const previous = this.writeQueue;
+    const current = previous.then(() => this.client.send({ data: line + '\n' }));
+    // Swallow rejection in the queue itself - a failed send shouldn't wedge
+    // every write after it. The actual error still reaches THIS call's own
+    // caller via the awaited `current` below.
+    this.writeQueue = current.catch(() => {});
+    await current;
   }
 
   close(): void {
@@ -162,22 +184,67 @@ class TcpLineChannel {
   }
 }
 
+// Sent (encrypted, like anything else on this channel) as a heartbeat and
+// filtered out in listenLoop before reaching messageCallback - SyncManager
+// never sees these. TCP keepalive alone isn't enough to catch a silently
+// dead peer in reasonable time: HarmonyOS's socket API only exposes an
+// on/off keepAlive flag, no interval tuning, so it falls back to whatever
+// the kernel's own default is (can be hours). This application-level
+// ping/watchdog is what actually makes "connected" reflect reality within
+// seconds instead of however long the OS takes to notice.
+const PING_SENTINEL = '__ping__';
+const HEARTBEAT_INTERVAL_MS = 5000;
+const HEARTBEAT_TIMEOUT_MS = 15000;
+
 export class PeerConnection {
   private messageCallback: ((message: string) => void) | null = null;
   private disconnectedCallback: (() => void) | null = null;
   private channel: TcpLineChannel;
   private sessionKey: Uint8Array;
+  private lastActivityAt: number = Date.now();
+  private heartbeatTimerId: number = -1;
   public readonly peerDeviceId: string;
+  // False means: this peer wasn't in the trust store when the handshake
+  // ran, and the connection only exists at all because pairingModeOpen was
+  // true (see create()'s relaxed gate below). The caller MUST treat this as
+  // a live pairing candidate - show an explicit accept/reject prompt fed by
+  // this already signature-verified peerDeviceId - rather than handing it
+  // straight to SyncManager like an ordinary already-trusted connection.
+  public readonly wasAlreadyTrusted: boolean;
+  // True only when wasAlreadyTrusted became true because THIS handshake's
+  // passphrase proof verified (not because the peer was already in the
+  // trust store) - the caller's signal to actually WRITE trust for this
+  // peer before treating the connection as normal, same as the LAN beacon's
+  // own auto-trust path already does.
+  public readonly newlyTrustedViaPassphrase: boolean;
 
-  private constructor(channel: TcpLineChannel, sessionKey: Uint8Array, peerDeviceId: string) {
+  private constructor(channel: TcpLineChannel, sessionKey: Uint8Array, peerDeviceId: string, wasAlreadyTrusted: boolean, newlyTrustedViaPassphrase: boolean) {
     this.channel = channel;
     this.sessionKey = sessionKey;
     this.peerDeviceId = peerDeviceId;
+    this.wasAlreadyTrusted = wasAlreadyTrusted;
+    this.newlyTrustedViaPassphrase = newlyTrustedViaPassphrase;
   }
 
-  // Returns null (never throws for a bad/malformed/untrusted peer) on any
-  // handshake failure - same contract as PeerConnection.cs's CreateAsync.
-  static async create(client: TcpLike, myIdentity: DeviceIdentity, trustStore: TrustStore, context: common.UIAbilityContext): Promise<PeerConnection | null> {
+  // pairingModeOpen: true only while the local Pairing screen is open (see
+  // Index.ets's pairingOpen) - a live, explicit "I'm expecting to pair right
+  // now" signal. Without it, an untrusted peer is refused exactly as before
+  // (same early-bail, no wasted signature verification) UNLESS their
+  // handshake carries a passphrase proof that verifies against
+  // passphraseKeyStore (see newlyTrustedViaPassphrase) - that's a second,
+  // independent way in, same as the LAN beacon's passive auto-trust already
+  // is regardless of pairing mode. With pairingModeOpen true, the handshake
+  // completes fully for a live accept/reject prompt instead - both sides
+  // need this true on their OWN "physically at the screen" behalf for a NEW
+  // pairing to succeed that way, since each side runs this same check
+  // independently over the same connection; the caller who gets back
+  // wasAlreadyTrusted=false is responsible for a local accept/reject prompt
+  // before writing trust.
+  //
+  // Returns null (never throws for a bad/malformed peer, or an untrusted
+  // one that's neither pairing-mode-eligible nor passphrase-verified) on
+  // any handshake failure - same contract as PeerConnection.cs's CreateAsync.
+  static async create(client: TcpLike, myIdentity: DeviceIdentity, trustStore: TrustStore, context: common.UIAbilityContext, pairingModeOpen: boolean, passphraseKeyStore: PassphraseKeyStore): Promise<PeerConnection | null> {
     const channel = new TcpLineChannel(client);
 
     try {
@@ -187,10 +254,14 @@ export class PeerConnection {
       const mySignature = await myIdentity.sign(ephemeralPubBytes);
       const myIdentityPublicKey = await myIdentity.getPublicKeyBase64();
 
+      const myKey = await passphraseKeyStore.getKey(context);
+      const myProof = myKey !== null ? await passphraseKeyStore.computeProof(myKey, myIdentityPublicKey) : undefined;
+
       const myHandshake: HandshakeMessage = {
         EphemeralPublicKey: base64Helper.encodeToStringSync(ephemeralPubBytes),
         IdentityPublicKey: myIdentityPublicKey,
         Signature: base64Helper.encodeToStringSync(mySignature),
+        PassphraseProof: myProof,
       };
       await channel.writeLine(JSON.stringify(myHandshake));
 
@@ -207,8 +278,14 @@ export class PeerConnection {
         return null;
       }
 
-      if (!(await trustStore.isTrusted(context, theirHandshake.IdentityPublicKey))) {
-        return null; // not a device we trust - refuse the connection outright
+      const alreadyTrusted = await trustStore.isTrusted(context, theirHandshake.IdentityPublicKey);
+      let passphraseVerified = false;
+      if (!alreadyTrusted && myKey !== null && theirHandshake.PassphraseProof) {
+        passphraseVerified = await passphraseKeyStore.verifyProof(myKey, theirHandshake.IdentityPublicKey, theirHandshake.PassphraseProof);
+      }
+      const effectivelyTrusted = alreadyTrusted || passphraseVerified;
+      if (!effectivelyTrusted && !pairingModeOpen) {
+        return null; // not a device we trust or can auto-trust, and not expecting to pair right now - refuse outright
       }
 
       let theirEphemeralPubBytes: Uint8Array;
@@ -231,7 +308,7 @@ export class PeerConnection {
       // no secretPrepend/secretAppend - that's just SHA256(rawSharedSecret).
       const sessionKey = await sha256(sharedSecret.data);
 
-      return new PeerConnection(channel, sessionKey, theirHandshake.IdentityPublicKey);
+      return new PeerConnection(channel, sessionKey, theirHandshake.IdentityPublicKey, effectivelyTrusted, passphraseVerified);
     } catch (e) {
       return null;
     }
@@ -253,9 +330,12 @@ export class PeerConnection {
   // Starts the read loop - fire-and-forget, matches PeerConnection.cs's
   // Listen() being kicked off without awaiting it. ANY failure (clean
   // close, corrupt/forged line that fails to decrypt) ends the whole
-  // connection, same as the Windows side's single catch-all.
+  // connection, same as the Windows side's single catch-all. Also starts
+  // the heartbeat - both begin together since a connection isn't "live"
+  // for either purpose until this point.
   listen(): void {
     void this.listenLoop();
+    this.startHeartbeat();
   }
 
   private async listenLoop(): Promise<void> {
@@ -264,16 +344,41 @@ export class PeerConnection {
         const line = await this.channel.readLine();
         if (line === null) break;
         const decrypted = await AesGcm.decrypt(this.sessionKey, line);
+        this.lastActivityAt = Date.now();
+        if (decrypted === PING_SENTINEL) continue; // heartbeat only, not real data
         this.messageCallback?.(decrypted);
       }
     } catch (e) {
       // abrupt disconnect, or a corrupt/forged line that failed to decrypt
     } finally {
+      this.stopHeartbeat();
       this.disconnectedCallback?.();
     }
   }
 
+  private startHeartbeat(): void {
+    this.heartbeatTimerId = setInterval(() => {
+      void this.send(PING_SENTINEL).catch(() => { /* a send failure will also surface via the read loop dying */ });
+      if (Date.now() - this.lastActivityAt > HEARTBEAT_TIMEOUT_MS) {
+        // Nothing at all (ping or real data) for HEARTBEAT_TIMEOUT_MS -
+        // the peer is gone even though TCP itself hasn't noticed yet.
+        // Closing here is what actually makes isConnected()/connectedCount
+        // reflect reality, instead of a connection nothing will ever mark
+        // dead until some much longer OS-level timeout eventually does.
+        this.close();
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimerId !== -1) {
+      clearInterval(this.heartbeatTimerId);
+      this.heartbeatTimerId = -1;
+    }
+  }
+
   close(): void {
+    this.stopHeartbeat();
     this.channel.close();
   }
 }

@@ -32,35 +32,10 @@ class Program
 
         var menu = new ContextMenuStrip();
 
-        var showQrItem = new ToolStripMenuItem("Show My QR Code");
-        showQrItem.Click += async (s, e) =>
+        var pairingItem = new ToolStripMenuItem("Pairing...");
+        pairingItem.Click += (s, e) =>
         {
-            var response = await ipcClient.Send(new IpcRequest("get_pairing_info"));
-            var pairingInfo = response?.Data != null
-                ? System.Text.Json.JsonSerializer.Deserialize<PairingInfo>(response.Data)
-                : null;
-            if (response != null && response.Success && pairingInfo != null)
-            {
-                new QrCodeForm(pairingInfo).Show();
-            }
-            else
-            {
-                MessageBox.Show("Could not reach the daemon. Is it running?", "Error");
-            }
-        };
-
-        var trustItem = new ToolStripMenuItem("Trust a Device");
-        trustItem.Click += async (s, e) =>
-        {
-            using var form = new TrustDeviceForm();
-            if (form.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(form.EnteredKey))
-            {
-                var response = await ipcClient.Send(new IpcRequest("trust_device", form.EnteredKey));
-                if (response == null || !response.Success)
-                {
-                    MessageBox.Show("Could not reach the daemon. Is it running?", "Error");
-                }
-            }
+            new PairingForm(ipcClient).Show();
         };
 
         var manageItem = new ToolStripMenuItem("Manage Devices");
@@ -72,8 +47,7 @@ class Program
         var exitItem = new ToolStripMenuItem("Exit");
         exitItem.Click += (s, e) => Application.Exit();
 
-        menu.Items.Add(showQrItem);
-        menu.Items.Add(trustItem);
+        menu.Items.Add(pairingItem);
         menu.Items.Add(manageItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(exitItem);

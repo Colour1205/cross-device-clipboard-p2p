@@ -14,6 +14,14 @@
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET"
+      },
+      {
+        // Normal/system_grant permission (confirmed against the official
+        // permission reference) - unlike READ_PASTEBOARD, this is safe to
+        // just declare: no ACL/AppGallery restricted-permission process,
+        // no runtime user dialog. Needed for the long-press menu's
+        // hapticFeedbackMode - see syncedItemCard's bindContextMenu.
+        "name": "ohos.permission.VIBRATE"
       }
     ],
     "abilities": [

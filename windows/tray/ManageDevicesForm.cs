@@ -8,6 +8,14 @@ public class ManageDevicesForm : Form
 {
     private readonly IpcClient ipcClient;
     private readonly ListView listView;
+    private readonly Label statusLabel;
+    private readonly System.Windows.Forms.Timer pollTimer;
+    // Guards against overlapping polls - without it, a Tick firing while a
+    // previous RefreshDevices() is still awaiting (e.g. the daemon isn't
+    // responding) stacks up more and more concurrent calls, each shown to
+    // the user - that's what caused a cascade of "Could not reach the
+    // daemon" dialogs when the daemon was stopped.
+    private bool isRefreshing = false;
 
     public ManageDevicesForm(IpcClient ipcClient)
     {
@@ -16,6 +24,15 @@ public class ManageDevicesForm : Form
         Width = 480;
         Height = 400;
         StartPosition = FormStartPosition.CenterScreen;
+
+        statusLabel = new Label
+        {
+            Text = "",
+            Dock = DockStyle.Top,
+            Height = 24,
+            ForeColor = System.Drawing.Color.Firebrick,
+            Visible = false
+        };
 
         listView = new ListView
         {
@@ -41,24 +58,58 @@ public class ManageDevicesForm : Form
         };
 
         Controls.Add(listView);
+        Controls.Add(statusLabel);
         Controls.Add(untrustButton);
 
-        Load += async (s, e) => await RefreshDevices();
+        // Previously only refreshed once on Load - the Connected/Not
+        // connected column never moved again after that, no matter what
+        // actually happened, since nothing re-queried the daemon. Polling
+        // while this window is open is the same low-effort fix
+        // PairingForm's pending-request check already uses.
+        pollTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+        pollTimer.Tick += async (s, e) => await RefreshDevices();
+        FormClosed += (s, e) => pollTimer.Stop();
+
+        Load += async (s, e) => { await RefreshDevices(); pollTimer.Start(); };
     }
 
+    // Rebuilding the whole list every poll (rather than diffing in place)
+    // does lose the current selection - acceptable here since this list is
+    // short and mostly glanced at, not actively navigated with the keyboard
+    // between polls.
     private async Task RefreshDevices()
     {
-        listView.Items.Clear();
+        if (isRefreshing) return; // previous poll still in flight - don't pile another on top
+        isRefreshing = true;
+        try
+        {
+            await RefreshDevicesCore();
+        }
+        finally
+        {
+            isRefreshing = false;
+        }
+    }
 
+    private async Task RefreshDevicesCore()
+    {
         var trustedResponse = await ipcClient.Send(new IpcRequest("list_trusted"));
         var connectedResponse = await ipcClient.Send(new IpcRequest("list_connections"));
 
         if (trustedResponse == null || !trustedResponse.Success)
         {
-            MessageBox.Show("Could not reach the daemon. Is it running?", "Error");
+            // Inline status text, not a MessageBox - this runs on every poll
+            // tick while the daemon is unreachable, and a modal dialog per
+            // tick is exactly what caused the earlier cascade. The list
+            // itself is left as-is (not cleared) so a transient hiccup
+            // doesn't blank it out.
+            statusLabel.Text = "Could not reach the daemon - is it running?";
+            statusLabel.Visible = true;
             return;
         }
+        statusLabel.Visible = false;
 
+        listView.Items.Clear();
         var trusted = trustedResponse.Data != null
             ? JsonSerializer.Deserialize<List<TrustedDevice>>(trustedResponse.Data) ?? new()
             : new List<TrustedDevice>();

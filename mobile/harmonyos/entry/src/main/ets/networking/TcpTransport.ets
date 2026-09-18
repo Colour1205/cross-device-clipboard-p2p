@@ -26,6 +26,17 @@ export class TcpServer {
       this.connectionCallback?.(conn);
     });
     await server.listen({ address: '0.0.0.0', port });
+    // Without this, a connection that's been idle for a while (this app
+    // only sends when the clipboard actually changes, so idle is the
+    // common case) can get silently dropped by an intermediate NAT or
+    // firewall along the path - especially plausible over Tailscale/
+    // WireGuard, where the "connection" is really just a NAT mapping that
+    // times out without periodic traffic. TCP keepalive pings keep that
+    // mapping (and any stateful firewall's idea of the connection) alive
+    // without needing real application data to flow. Individual accepted
+    // TCPSocketConnections don't expose setExtraOptions themselves in this
+    // SDK - only the server does, applying to connections it accepts.
+    await server.setExtraOptions({ keepAlive: true }).catch(() => { /* best-effort - not fatal if unsupported */ });
   }
 
   stop(): void {
@@ -42,6 +53,10 @@ export class TcpServer {
 export async function connectTcp(address: string, port: number, timeoutMs: number = 5000): Promise<socket.TCPSocket> {
   const client = socket.constructTCPSocketInstance();
   await client.connect({ address: { address, port }, timeout: timeoutMs });
+  // See TcpServer.start's matching comment - keeps an idle connection (and
+  // any NAT mapping it depends on, e.g. over Tailscale) alive without
+  // needing real traffic to flow.
+  await client.setExtraOptions({ keepAlive: true }).catch(() => { /* best-effort - not fatal if unsupported */ });
   return client;
 }
 

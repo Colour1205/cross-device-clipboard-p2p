@@ -3,37 +3,92 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using ClipboardDaemon.Identity;
+using ClipboardDaemon.Crypto;
 
 namespace ClipboardDaemon.Networking;
 
 public class PeerConnection
 {
+    // Sent (encrypted, like anything else on this channel) as a heartbeat
+    // and filtered out in Listen() before reaching MessageReceived - normal
+    // message handling never sees these. TCP keepalive alone (see
+    // Program.cs's EnableKeepAlive) isn't enough by itself to catch a
+    // silently dead peer in reasonable time - depending on OS/network
+    // conditions it can still take much longer than feels "live". This
+    // application-level ping/watchdog is what actually makes a connection
+    // list reflect reality within seconds of a peer actually going away.
+    private const string PingSentinel = "__ping__";
+    private const int HeartbeatIntervalMs = 5000;
+    private const int HeartbeatTimeoutMs = 15000;
+
     private readonly TcpClient client;
     private readonly StreamReader reader;
     private readonly StreamWriter writer;
     private readonly byte[] sessionKey;
+    private DateTime lastActivityAt = DateTime.UtcNow;
+    private System.Threading.Timer? heartbeatTimer;
+    // StreamWriter isn't safe for concurrent calls - without this, the
+    // heartbeat timer's own Send(ping) can race a real Send() from, say,
+    // StreamFileToPeer's chunk loop (different threads entirely) and
+    // corrupt the writer's internal state. That's what an
+    // ArgumentOutOfRangeException out of WriteLineAsync actually was -
+    // this serializes every Send() so only one write is ever in flight.
+    private readonly SemaphoreSlim writeLock = new(1, 1);
 
     // Known the moment the connection is created — verified during the
     // handshake, not inferred later from message content.
     public string PeerDeviceId { get; }
 
+    // False means this peer wasn't in the trust store when the handshake
+    // ran, and the connection only exists at all because pairingModeOpen
+    // was true (see CreateAsync's relaxed gate below). Callers MUST treat
+    // this as a live pairing candidate — show an explicit accept/reject
+    // prompt fed by this already signature-verified PeerDeviceId — rather
+    // than handing it straight to normal message processing.
+    public bool WasAlreadyTrusted { get; }
+
+    // True only when WasAlreadyTrusted became true because THIS handshake's
+    // passphrase proof verified (not because the peer was already in the
+    // trust store) - the caller's signal to actually WRITE trust for this
+    // peer before treating the connection as normal, same as the LAN
+    // beacon's own auto-trust path already does.
+    public bool NewlyTrustedViaPassphrase { get; }
+
     public event Action<string>? MessageReceived;
     public event Action? Disconnected;
 
-    private PeerConnection(TcpClient client, StreamReader reader, StreamWriter writer, byte[] sessionKey, string peerDeviceId)
+    private PeerConnection(TcpClient client, StreamReader reader, StreamWriter writer, byte[] sessionKey, string peerDeviceId, bool wasAlreadyTrusted, bool newlyTrustedViaPassphrase)
     {
         this.client = client;
         this.reader = reader;
         this.writer = writer;
         this.sessionKey = sessionKey;
         PeerDeviceId = peerDeviceId;
+        WasAlreadyTrusted = wasAlreadyTrusted;
+        NewlyTrustedViaPassphrase = newlyTrustedViaPassphrase;
     }
 
     // Performs the authenticated ECDH handshake described in HandshakeMessage.cs.
-    // Returns null (never throws for a bad/untrusted peer) if the handshake
-    // fails, the signature doesn't verify, or the peer isn't in our trust
-    // store — callers should just close the socket and move on.
-    public static async Task<PeerConnection?> CreateAsync(TcpClient client, DeviceIdentity myIdentity, TrustStore trustStore)
+    // Returns null (never throws for a bad peer, or an untrusted one that's
+    // neither pairing-mode-eligible nor passphrase-verified) if the
+    // handshake fails or the signature doesn't verify — callers should just
+    // close the socket and move on.
+    //
+    // pairingModeOpen: true only while the local tray's pairing dialog is
+    // open (mirrors HarmonyOS's Index.ets pairingOpen) — a live, explicit
+    // "I'm expecting to pair right now" signal. Without it, an untrusted
+    // peer is refused exactly as before (same early-bail, no wasted
+    // signature verification) UNLESS their handshake carries a passphrase
+    // proof that verifies against passphraseKeyStore (see
+    // NewlyTrustedViaPassphrase) - a second, independent way in, same as
+    // the LAN beacon's passive auto-trust already is regardless of pairing
+    // mode. With pairingModeOpen true, the handshake completes fully for a
+    // live accept/reject prompt instead - both sides need this true on
+    // their OWN behalf for a NEW pairing to succeed that way, since each
+    // independently runs this same check over the same connection; the
+    // caller who gets back WasAlreadyTrusted=false is responsible for a
+    // local accept/reject prompt before writing trust.
+    public static async Task<PeerConnection?> CreateAsync(TcpClient client, DeviceIdentity myIdentity, TrustStore trustStore, bool pairingModeOpen, PassphraseKeyStore passphraseKeyStore)
     {
         Stream stream = client.GetStream();
         var reader = new StreamReader(stream);
@@ -43,10 +98,14 @@ public class PeerConnection
         byte[] myEphemeralPublicKey = ecdh.PublicKey.ExportSubjectPublicKeyInfo();
         byte[] mySignature = myIdentity.SignData(myEphemeralPublicKey);
 
+        byte[]? myKey = passphraseKeyStore.GetKey();
+        string? myProof = myKey != null ? PassphraseAuth.ComputeProof(myKey, myIdentity.GetPublicKey()) : null;
+
         var myHandshake = new HandshakeMessage(
             Convert.ToBase64String(myEphemeralPublicKey),
             myIdentity.GetPublicKey(),
-            Convert.ToBase64String(mySignature));
+            Convert.ToBase64String(mySignature),
+            myProof);
         await writer.WriteLineAsync(JsonSerializer.Serialize(myHandshake));
 
         string? theirHandshakeJson = await reader.ReadLineAsync();
@@ -60,9 +119,16 @@ public class PeerConnection
         catch (JsonException) { return null; }
         if (theirHandshake == null) return null;
 
-        if (!trustStore.IsTrusted(theirHandshake.IdentityPublicKey))
+        bool alreadyTrusted = trustStore.IsTrusted(theirHandshake.IdentityPublicKey);
+        bool passphraseVerified = false;
+        if (!alreadyTrusted && myKey != null && theirHandshake.PassphraseProof != null)
         {
-            return null; // not a device we trust — refuse the connection outright
+            passphraseVerified = PassphraseAuth.VerifyProof(myKey, theirHandshake.IdentityPublicKey, theirHandshake.PassphraseProof);
+        }
+        bool effectivelyTrusted = alreadyTrusted || passphraseVerified;
+        if (!effectivelyTrusted && !pairingModeOpen)
+        {
+            return null; // not a device we trust or can auto-trust, and not expecting to pair right now — refuse outright
         }
 
         byte[] theirEphemeralPublicKeyBytes;
@@ -91,36 +157,74 @@ public class PeerConnection
 
         byte[] sessionKey = ecdh.DeriveKeyFromHash(theirEcdh.PublicKey, HashAlgorithmName.SHA256);
 
-        return new PeerConnection(client, reader, writer, sessionKey, theirHandshake.IdentityPublicKey);
+        return new PeerConnection(client, reader, writer, sessionKey, theirHandshake.IdentityPublicKey, effectivelyTrusted, passphraseVerified);
     }
 
     public async Task Send(string message)
     {
-        await writer.WriteLineAsync(Encrypt(message));
+        string encrypted = Encrypt(message);
+        await writeLock.WaitAsync();
+        try
+        {
+            await writer.WriteLineAsync(encrypted);
+        }
+        finally
+        {
+            writeLock.Release();
+        }
     }
 
     public async Task Listen()
     {
+        StartHeartbeat();
         try
         {
             while (true)
             {
                 string? line = await reader.ReadLineAsync();
                 if (line == null) break; // peer closed cleanly
-                MessageReceived?.Invoke(Decrypt(line));
+                lastActivityAt = DateTime.UtcNow;
+                string decrypted = Decrypt(line);
+                if (decrypted == PingSentinel) continue; // heartbeat only, not real data
+                MessageReceived?.Invoke(decrypted);
             }
         }
         catch (Exception) { } // abrupt disconnect, or a corrupt/forged line that failed to decrypt
         finally
         {
+            StopHeartbeat();
             Disconnected?.Invoke();
         }
+    }
+
+    private void StartHeartbeat()
+    {
+        heartbeatTimer = new System.Threading.Timer(_ =>
+        {
+            _ = Send(PingSentinel); // fire-and-forget - a send failure also surfaces via Listen()'s read loop dying
+            if ((DateTime.UtcNow - lastActivityAt).TotalMilliseconds > HeartbeatTimeoutMs)
+            {
+                // Nothing at all (ping or real data) for HeartbeatTimeoutMs -
+                // the peer is gone even though TCP itself hasn't noticed
+                // yet. Closing here is what actually makes the connections
+                // list reflect reality, instead of relying on some much
+                // longer OS-level timeout to eventually notice.
+                Close();
+            }
+        }, null, HeartbeatIntervalMs, HeartbeatIntervalMs);
+    }
+
+    private void StopHeartbeat()
+    {
+        heartbeatTimer?.Dispose();
+        heartbeatTimer = null;
     }
 
     // Actively tears down the connection — used when a device gets untrusted
     // while still connected.
     public void Close()
     {
+        StopHeartbeat();
         client.Close();
     }
 

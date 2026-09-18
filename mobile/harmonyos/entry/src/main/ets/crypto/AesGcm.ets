@@ -20,8 +20,19 @@ const TAG_SIZE = 16;
 const base64Helper = new util.Base64Helper();
 const decoder = util.TextDecoder.create('utf-8');
 
+// See Signing.ets's stringToBytes for the full explanation - this was the
+// SAME bug (truncating UTF-16 code units into single bytes instead of real
+// UTF-8 encoding), but here it's worse: it corrupted the actual PLAINTEXT
+// fed into AES-GCM encryption for any message containing a non-ASCII
+// character, not just a signature check. Encryption/decryption still
+// "succeeded" (the auth tag is self-consistent with whatever bytes were
+// actually encrypted), so this failed silently further downstream instead
+// of as a decrypt error - typically as a JSON parse failure on the
+// now-corrupted decrypted string, causing the whole message to be
+// silently dropped.
+const textEncoder = util.TextEncoder.create('utf-8');
 function utf8Bytes(s: string): Uint8Array {
-  return new Uint8Array(Array.from(s).map(c => c.charCodeAt(0)));
+  return textEncoder.encodeInto(s);
 }
 
 function randomBytes(len: number): Uint8Array {

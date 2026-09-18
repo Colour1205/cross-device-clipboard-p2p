@@ -26,7 +26,12 @@ public static class DaemonLauncher
                 FileName = daemonExe,
                 Arguments = label,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                // Was true - which meant every Console.WriteLine debug line
+                // this daemon prints (connection/disconnect, file transfer
+                // progress, discovered peers, etc.) went nowhere visible in
+                // the normal auto-started flow. A visible console window is
+                // the actual point of those log lines.
+                CreateNoWindow = false
             });
             return true;
         }

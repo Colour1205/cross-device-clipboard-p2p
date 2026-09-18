@@ -23,15 +23,19 @@ import pasteboard from '@ohos.pasteboard';
 import { image } from '@kit.ImageKit';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { util } from '@kit.ArkTS';
+import fs from '@ohos.file.fs';
+import fileUri from '@ohos.file.fileuri';
+import { common } from '@kit.AbilityKit';
 
 const base64Helper = new util.Base64Helper();
 
-export type ClipboardContentType = 'text' | 'image' | 'unsupported';
+export type ClipboardContentType = 'text' | 'image' | 'file' | 'unsupported';
 
 export interface ClipboardChange {
   type: ClipboardContentType;
-  content: string; // text content, or base64-encoded PNG bytes for images
+  content: string; // text; base64 PNG for images; base64 raw bytes for files
   hash: string;
+  fileName?: string; // only set for type 'file'
   detail?: string; // e.g. the unsupported mime type list, or an error message
 }
 
@@ -46,8 +50,15 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
   return out;
 }
 
+// See crypto/Signing.ets's stringToBytes for the full explanation - this
+// was the same bug (truncating UTF-16 code units into single bytes instead
+// of real UTF-8 encoding). Here it only affected the hash used for local
+// change-detection dedup (the actual copied text itself was never mangled
+// by this), but a wrong hash for non-ASCII text meant it wouldn't reliably
+// suppress echoes/duplicates of that text either.
+const textEncoder = util.TextEncoder.create('utf-8');
 function utf8Bytes(s: string): Uint8Array {
-  return new Uint8Array(Array.from(s).map(c => c.charCodeAt(0)));
+  return textEncoder.encodeInto(s);
 }
 
 function arrayBufferToBase64(buf: ArrayBuffer): string {
@@ -85,8 +96,10 @@ export class ClipboardWatcher {
 
   // Only valid to call from inside a PasteButton onClick handler, in the
   // window after a SUCCESS result — that's what grants the temporary
-  // pasteboard read privilege this needs.
-  async readCurrentClipboard(): Promise<ClipboardChange | null> {
+  // pasteboard read privilege this needs. context is only used for the
+  // file branch (see below) - needed to copy a cross-app URI into this
+  // app's own sandbox before it can be read.
+  async readCurrentClipboard(context: common.UIAbilityContext): Promise<ClipboardChange | null> {
     try {
       const data = await pasteboard.getSystemPasteboard().getData();
 
@@ -105,6 +118,40 @@ export class ClipboardWatcher {
         if (hash === this.lastKnownHash) return null;
         this.lastKnownHash = hash;
         return { type: 'text', content: text, hash };
+      } else if (data.hasMimeType(pasteboard.MIMETYPE_TEXT_URI)) {
+        // A URI handed to us via the pasteboard is scoped to the app that
+        // copied it (e.g. Files), not to us - fs.openSync-ing it directly
+        // fails silently/errors, because only the file-management APIs
+        // (fs.copy) actually consume the transient cross-app read grant
+        // the pasteboard service holds for that URI. Per the official
+        // "使用系统剪贴板实现复制粘贴" guide: copy it into our own sandbox
+        // first via fs.copy, THEN read the local copy normally. Reads the
+        // whole file into memory as base64 afterward, same tradeoff the
+        // image branch above already makes - fine for the file sizes this
+        // is meant for, not for anything huge.
+        const uri = data.getPrimaryUri();
+        try {
+          const fileName = decodeURIComponent(uri.split('/').pop() ?? 'file');
+          const tempPath = `${context.cacheDir}/incoming_clipboard_file`;
+          await fs.copy(uri, fileUri.getUriFromPath(tempPath));
+
+          const file = fs.openSync(tempPath, fs.OpenMode.READ_ONLY);
+          let buffer: ArrayBuffer;
+          try {
+            const size = fs.statSync(file.fd).size;
+            buffer = new ArrayBuffer(size);
+            fs.readSync(file.fd, buffer);
+          } finally {
+            fs.closeSync(file);
+          }
+          const bytes = new Uint8Array(buffer);
+          const hash = await sha256Hex(bytes);
+          if (hash === this.lastKnownHash) return null;
+          this.lastKnownHash = hash;
+          return { type: 'file', content: arrayBufferToBase64(buffer), hash, fileName };
+        } catch (e) {
+          return { type: 'unsupported', content: '', hash: '', detail: `could not read file: ${e}` };
+        }
       } else {
         return { type: 'unsupported', content: '', hash: '', detail: data.getMimeTypes().join(', ') };
       }

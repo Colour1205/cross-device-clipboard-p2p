@@ -33,6 +33,17 @@ function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
 // The SymKey is converted once and reused across every iteration — only
 // the message being MAC'd changes — since re-deriving it per call would be
 // both unnecessary and slow.
+//
+// Uses the *Sync* Mac methods (initSync/updateSync/doFinalSync), not the
+// async ones - at 210,000 iterations x 3 calls each, the async version's
+// per-call promise/native-bridge round-trip overhead (not the actual HMAC
+// compute) is what made this look permanently stuck in practice rather
+// than just slow; SDK docs note the sync variants exist specifically for
+// tight loops like this. That trades away the async version's one real
+// advantage (yielding to the event loop between calls, keeping the UI
+// thread free) for something that actually finishes - setPassphrase is a
+// rare, one-off action, so a brief main-thread pause here is the right
+// side of that tradeoff versus a setup flow that never visibly completes.
 export async function pbkdf2Sha256Manual(password: Uint8Array, salt: Uint8Array, iterations: number, keyLenBytes: number): Promise<Uint8Array> {
   const hLen = 32; // SHA-256 output size
   const blockCount = Math.ceil(keyLenBytes / hLen);
@@ -43,14 +54,14 @@ export async function pbkdf2Sha256Manual(password: Uint8Array, salt: Uint8Array,
 
   const dk = new Uint8Array(blockCount * hLen);
   for (let blockIndex = 1; blockIndex <= blockCount; blockIndex++) {
-    await mac.init(symKey);
-    await mac.update({ data: concatBytes(salt, int32BE(blockIndex)) });
-    let u = (await mac.doFinal()).data;
+    mac.initSync(symKey);
+    mac.updateSync({ data: concatBytes(salt, int32BE(blockIndex)) });
+    let u = mac.doFinalSync().data;
     const t = new Uint8Array(u);
     for (let iter = 2; iter <= iterations; iter++) {
-      await mac.init(symKey);
-      await mac.update({ data: u });
-      u = (await mac.doFinal()).data;
+      mac.initSync(symKey);
+      mac.updateSync({ data: u });
+      u = mac.doFinalSync().data;
       xorInPlace(t, u);
     }
     dk.set(t, (blockIndex - 1) * hLen);

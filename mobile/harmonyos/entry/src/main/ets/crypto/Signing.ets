@@ -32,8 +32,21 @@ export interface ClipboardEntry {
   Signature?: string;
 }
 
+// Was `new Uint8Array(Array.from(s).map(c => c.charCodeAt(0)))` - that
+// takes each UTF-16 code unit's raw numeric value and truncates it into a
+// SINGLE byte (Uint8Array silently wraps mod 256), which only happens to
+// produce correct bytes for pure ASCII (codepoints 0-127, where the UTF-16
+// code unit and the UTF-8 byte are numerically identical). Any character
+// outside that range (e.g. a "smart quote" like U+2019, accented letters,
+// emoji) got mangled into a different, wrong byte instead of its real
+// multi-byte UTF-8 encoding - and since .NET's Encoding.UTF8.GetBytes on
+// the Windows side encodes correctly, the two sides disagreed on what was
+// actually signed, and every entry containing so much as one non-ASCII
+// character failed verification here on receipt (or the other way, if the
+// entry was signed on this device and Windows verified it).
+const textEncoder = util.TextEncoder.create('utf-8');
 function stringToBytes(s: string): Uint8Array {
-  return new Uint8Array(Array.from(s).map(c => c.charCodeAt(0)));
+  return textEncoder.encodeInto(s);
 }
 
 // Matches .NET's DateTime.ToString("o") for a freshly-generated UTC
