@@ -20,3 +20,4 @@ Thumbs.db
 
 # Logs and scratch files created while testing this project locally
 *.log
+mobile/harmonyos/.codegenie/
