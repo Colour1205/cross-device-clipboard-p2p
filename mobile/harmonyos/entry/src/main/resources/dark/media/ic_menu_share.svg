@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#E5E5E5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Tray -->
+  <path d="M4 12V18C4 19.1046 4.89543 20 6 20H18C19.1046 20 20 19.1046 20 18V12"/>
+  <!-- Arrow upward -->
+  <polyline points="16 7 12 3 8 7"/>
+  <line x1="12" y1="3" x2="12" y2="15"/>
+</svg>

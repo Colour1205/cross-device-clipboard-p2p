@@ -115,6 +115,15 @@ export class SyncManager {
     this.connectionsChangedCallback?.(this.connections.size);
     conn.onMessage((msg: string) => { void this.handleMessage(msg, conn); });
     conn.onDisconnected(() => {
+      // Only evict if the map still points at THIS connection. Removing by
+      // peerDeviceId alone meant a stale link's teardown deleted the newer,
+      // live connection that had replaced it - after which isConnected()
+      // said false, so the next 2-second discovery beacon dialled again,
+      // and the whole thing looped forever without clipboard ever flowing.
+      // The Windows daemon carries the identical guard (Program.cs's
+      // Disconnected handler); both ends need it or the other end's churn
+      // keeps the loop alive.
+      if (this.connections.get(conn.peerDeviceId) !== conn) return;
       this.connections.delete(conn.peerDeviceId);
       this.connectionsChangedCallback?.(this.connections.size);
       this.logCallback?.(`peer disconnected: ${conn.peerDeviceId.slice(0, 20)}...`);

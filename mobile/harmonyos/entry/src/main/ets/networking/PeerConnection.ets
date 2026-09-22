@@ -10,6 +10,7 @@
 import socket from '@ohos.net.socket';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { util } from '@kit.ArkTS';
+import { BusinessError } from '@kit.BasicServicesKit';
 import { common } from '@kit.AbilityKit';
 import { DeviceIdentity, verifyRawSignature } from '../identity/DeviceIdentity';
 import { TrustStore } from '../identity/TrustStore';
@@ -193,8 +194,15 @@ class TcpLineChannel {
 // ping/watchdog is what actually makes "connected" reflect reality within
 // seconds instead of however long the OS takes to notice.
 const PING_SENTINEL = '__ping__';
-const HEARTBEAT_INTERVAL_MS = 5000;
-const HEARTBEAT_TIMEOUT_MS = 15000;
+// Deliberately tighter than the Windows daemon's 5000/15000. What
+// actually has to hold is that EACH side pings faster than the OTHER
+// side's timeout, and both directions satisfy that: this pings every 3s
+// against the daemon's 15s timeout, the daemon pings every 5s against
+// this 9s timeout. Tightening only this end is therefore safe, and it
+// cuts how long the UI can show a stale "Connected" for a silently-dead
+// peer from ~15-20s to ~9-12s.
+const HEARTBEAT_INTERVAL_MS = 3000;
+const HEARTBEAT_TIMEOUT_MS = 9000;
 
 export class PeerConnection {
   private messageCallback: ((message: string) => void) | null = null;

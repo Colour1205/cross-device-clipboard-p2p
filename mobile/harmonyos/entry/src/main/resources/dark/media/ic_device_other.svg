@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="#E5E5E5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Hardware node / mystery terminal -->
+  <rect x="4" y="4" width="16" height="16" rx="3.5"/>
+  <!-- Subtle query glyph / connection signal -->
+  <path d="M10 9C10 7.89543 10.8954 7 12 7C13.1046 7 14 7.89543 14 9C14 10.2 12.8 10.8 12 11.8V12.5"/>
+  <circle cx="12" cy="15.5" r="0.75" fill="#E5E5E5"/>
+</svg>

@@ -11,6 +11,21 @@
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
+    // Per uiMaterial's own reference doc: in the default mode, Navigation/
+    // NavDestination title bars do NOT get immersive material
+    // automatically - only specific popup/dialog components do. "enable"
+    // turns it on by default for Navigation/NavDestination (among others)
+    // so their native title bar and back button get the effect without
+    // any manual systemMaterial() call on custom-built replacement
+    // widgets - the native rendering handles correct positioning/safe-area
+    // clearance for free, which repeated attempts at a custom title
+    // builder could not reliably reproduce.
+    "metadata": [
+      {
+        "name": "ohos.arkui.UIMaterial.state",
+        "value": "enable"
+      }
+    ],
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET"

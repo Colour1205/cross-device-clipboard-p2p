@@ -14,11 +14,14 @@
 // PeerConnection, and SyncManager, all built and verified in earlier steps.
 
 import hilog from '@ohos.hilog';
-import { common } from '@kit.AbilityKit';
+import { common, Want, wantConstant } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { window, promptAction, curves } from '@kit.ArkUI';
+import { window, promptAction, curves, CircleShape, SegmentButton, SegmentButtonOptions,
+  ItemRestriction, SegmentButtonTextItem, LengthMetrics } from '@kit.ArkUI';
 import { scanBarcode } from '@kit.ScanKit';
 import { systemShare } from '@kit.ShareKit';
+import { filePreview } from '@kit.PreviewKit';
+import { uniformTypeDescriptor } from '@kit.ArkData';
 import { util } from '@kit.ArkTS';
 import pasteboard from '@ohos.pasteboard';
 import fs from '@ohos.file.fs';
@@ -27,6 +30,7 @@ import photoAccessHelper from '@ohos.file.photoAccessHelper';
 import picker from '@ohos.file.picker';
 import uiMaterial from '@ohos.arkui.uiMaterial';
 import unifiedDataChannel from '@ohos.data.unifiedDataChannel';
+import { vibrator } from '@kit.SensorServiceKit';
 import { ClipboardWatcher } from '../clipboard/ClipboardWatcher';
 import { DeviceIdentity } from '../identity/DeviceIdentity';
 import { TrustStore, TrustedDevice } from '../identity/TrustStore';
@@ -68,12 +72,39 @@ function netLog(msg: string): void {
   hilog.info(NET_LOG_DOMAIN, NET_LOG_TAG, '%{public}s', msg);
 }
 
+// System haptic feedback for every tap/long-press, matching what
+// bindContextMenu's own hapticFeedbackMode already gives the long-press
+// menu. clickEffect (used throughout this file) is a visual bounce only -
+// confirmed against Huawei's own ArkUI reference, it has no haptic
+// component at all - so getting an actual system vibration on an ordinary
+// Button/onClick requires calling the imperative @ohos.vibrator module
+// directly, there's no declarative "add haptic to this click" attribute.
+// 'haptic.effect.sharp' (not 'soft') per @ohos.vibrator's HapticFeedback
+// enum docs: soft is described as a looser, lower-frequency vibration -
+// which is what read as "a very short duration vibration" rather than a
+// tick - while sharp is the higher-frequency, crisp preset, matching the
+// short "tick" feel bindContextMenu's hapticFeedbackMode:ENABLED gives on
+// long-press. Fire-and-forget: a missing/unsupported vibrator on some
+// device should never block or throw out of a click handler over
+// something this cosmetic.
+function tapHaptic(): void {
+  vibrator.startVibration({ type: 'preset', effectId: 'haptic.effect.sharp', count: 1 }, { usage: 'touch' })
+    .catch(() => { /* no haptic hardware, or effect unsupported - fine to just skip it */ });
+}
+
 // Merged view of a device for the UI - could be trusted, discovered (via
 // beacon), connected, or any combination. A device the user has never
 // trusted but whose beacon we've heard is "discovered only"; a trusted
 // device we haven't heard from recently is "trusted only".
 interface DeviceRow {
   deviceId: string;
+  // Every address this peer is reachable at, de-duplicated: the LAN IP the
+  // beacon actually arrived from, the address the beacon advertises (which
+  // is the Tailscale/off-LAN one when set), and whatever the trust store
+  // cached from pairing. Previously a single field, and the beacon's LAN
+  // IP overwrote the stored one - so a device paired over Tailscale showed
+  // only its LAN address, or vice versa.
+  addresses: string[];
   address: string | null;
   trusted: boolean;
   discovered: boolean;
@@ -123,6 +154,23 @@ function isImageFileName(name: string): boolean {
   return IMAGE_FILE_EXTENSIONS.some(ext => lower.endsWith(ext));
 }
 
+// Extension -> MIME, via UDMF's own type table rather than a hand-rolled
+// map. getTypeDescriptor is typed non-null but documented to return null
+// for an unknown type id, hence the guard.
+function mimeTypeForFileName(fileName: string): string {
+  const dot: number = fileName.lastIndexOf('.');
+  if (dot < 0) return 'application/octet-stream';
+  try {
+    const typeId: string = uniformTypeDescriptor.getUniformDataTypeByFilenameExtension(fileName.substring(dot));
+    const descriptor: uniformTypeDescriptor.TypeDescriptor = uniformTypeDescriptor.getTypeDescriptor(typeId);
+    if (descriptor === null || descriptor === undefined) return 'application/octet-stream';
+    const mimes: Array<string> = descriptor.mimeTypes;
+    return mimes.length > 0 ? mimes[0] : 'application/octet-stream';
+  } catch (e) {
+    return 'application/octet-stream';
+  }
+}
+
 function previewFor(entry: ClipboardEntry): string {
   if (entry.Type === 'text') {
     return entry.Content.length > 80 ? `${entry.Content.slice(0, 80)}...` : entry.Content;
@@ -163,7 +211,7 @@ struct SelectTextDialog {
       .width('100%')
       .constraintSize({ maxHeight: 320 })
 
-      Button('Close').fontSize(13).onClick(() => { this.controller?.close(); })
+      Button('Close').fontSize(13).onClick(() => { tapHaptic(); this.controller?.close(); })
     }
     .width('100%')
     .padding(16)
@@ -187,10 +235,11 @@ struct SaveImageDialog {
       SaveButton({ text: SaveDescription.SAVE_TO_GALLERY, buttonType: ButtonType.Capsule })
         .fontSize(14)
         .onClick((event: ClickEvent, result: SaveButtonOnClickResult) => {
+          tapHaptic();
           this.onSave(result);
           this.controller?.close();
         })
-      Button('Cancel').fontSize(13).onClick(() => { this.controller?.close(); })
+      Button('Cancel').fontSize(13).onClick(() => { tapHaptic(); this.controller?.close(); })
     }
     .width('100%')
     .padding(20)
@@ -229,7 +278,31 @@ struct Index {
   @State selectedItemId: string = '';
   // List vs 2-column WaterFlow grid for the Synced tab - see syncedTab's
   // viewModeToggleButton.
-  @State syncedViewMode: string = 'list';
+  @State syncedViewMode: string = 'waterfall';
+  // Backing state for the List/Grid SegmentButton. SegmentButton takes its
+  // options via @ObjectLink and its selection via @Link, so both have to
+  // live as real state on this component rather than being built inline in
+  // the builder. Index 0 = List, 1 = Grid; syncedViewMode stays the single
+  // source of truth for which view actually renders, and onSelectedChange
+  // keeps the two in step.
+  @State viewModeOptions: SegmentButtonOptions = SegmentButtonOptions.tab({
+    buttons: [{ text: 'List' }, { text: 'Grid' }] as ItemRestriction<SegmentButtonTextItem>,
+    // Every colour set explicitly from tokens. Left to its defaults, the
+    // selected item rendered near-white text on a mid-grey thumb in dark
+    // mode - the label colour did not invert with the theme the way the
+    // thumb did, so the selected option was the least readable thing in
+    // the bar. font_primary/font_secondary and the comp_background_*
+    // surfaces all re-resolve per theme, so the pairing holds in both.
+    fontColor: $r('sys.color.font_secondary'),
+    selectedFontColor: $r('sys.color.font_primary'),
+    backgroundColor: $r('sys.color.comp_background_tertiary'),
+    selectedBackgroundColor: $r('sys.color.comp_background_primary'),
+    backgroundSystemMaterial: new uiMaterial.ImmersiveMaterial({
+      style: uiMaterial.ImmersiveStyle.THIN,
+      colorInvert: true,
+    }),
+  });
+  @State viewModeSelection: number[] = [1];
   // Two-finger pinch zoom on the item detail image - imageZoomScale is what
   // Image.scale() actually reads; imageZoomBase is the scale it was at when
   // the current pinch gesture started, since GestureEvent.scale is relative
@@ -274,6 +347,26 @@ struct Index {
   private fileStore: FileStore | null = null;
   private connectingTo: Set<string> = new Set();
   private offLanReconnectTimerId: number = -1;
+  // Real Navigation/NavDestination stacks, one per tab that needs its own
+  // sub-navigation. Immersive material (systemMaterial) is only rendered by
+  // the system inside a Navigation/NavDestination title bar (or a
+  // BarPosition.End Tabs bottom bar) - confirmed against Huawei's own
+  // @ohos.arkui.uiMaterial reference (updated 2026-09-20): "其他组件仅在
+  // Navigation/NavDestination标题栏...中生效。在其他区域中设置沉浸光感效果不生效"
+  // ("all other components only take effect inside a Navigation/
+  // NavDestination title bar... elsewhere, setting it has no effect at
+  // all"). A plain Button anywhere else - which is what every back button
+  // here used to be - can NEVER show this effect, regardless of styling.
+  // Two separate stacks (not one shared) since the Synced tab's list<->
+  // detail navigation and the Me tab's main<->sub-screen navigation are
+  // fully independent of each other.
+  private syncedNavStack: NavPathStack = new NavPathStack();
+  private meNavStack: NavPathStack = new NavPathStack();
+  // Devices used to be the one tab with no Navigation at all - just a
+  // Column with its title in normal flow, which is why its content could
+  // never scroll behind anything and its header had no material. It gets
+  // the same stack/destination treatment as the other two now.
+  private devicesNavStack: NavPathStack = new NavPathStack();
   // Deterministic for a given (key, deviceId) pair - computed once whenever
   // the passphrase changes (or at startup, if one was already set) and
   // reused on every beacon tick, rather than re-deriving it every 2 seconds.
@@ -284,6 +377,16 @@ struct Index {
 
   aboutToAppear(): void {
     this.immersiveSupported = uiMaterial.isImmersiveMaterialSupported();
+
+    // Initial (home) route on each stack, pushed with animation off (the
+    // `false` second argument) - matches Huawei's own documented pattern
+    // for a Navigation that pushes its first page from aboutToAppear
+    // (arkts-navigation-faq's "router、navigation动画冲突" entry). hideNavBar
+    // makes the pushed page itself the visible "home" screen rather than a
+    // separate NavBar underneath it.
+    this.syncedNavStack.pushPath({ name: 'syncedList' }, false);
+    this.meNavStack.pushPath({ name: 'meMain' }, false);
+    this.devicesNavStack.pushPath({ name: 'devicesMain' }, false);
 
     const context = getContext(this) as common.UIAbilityContext;
     window.getLastWindow(context).then((win: window.Window) => {
@@ -306,19 +409,27 @@ struct Index {
         type: entry.Type,
         preview: previewFor(entry),
         content: entry.Content,
-        source: entry.DeviceId === this.ownDeviceId ? 'This device' : `${entry.DeviceId.slice(0, 12)}...`,
+        source: this.sourceLabelFor(entry.DeviceId),
         time: entry.Timestamp.slice(11, 16),
         fromPeer,
       };
       this.syncedItems = [item, ...this.syncedItems].slice(0, 50);
     });
     syncManager.onLog((message: string) => {
-      this.syncLog = [message, ...this.syncLog].slice(0, 30);
+      this.log(message);
     });
     // The connections Map lives inside SyncManager and isn't itself
     // reactive - without this the Devices tab's connected-device count
     // never updated after the first render even though the underlying
     // count was always correct (see SyncManager.ets's onConnectionsChanged).
+    // Deliberately does nothing but assign the count. This callback is
+    // invoked synchronously from inside SyncManager.registerConnection,
+    // BEFORE conn.listen() - so anything that throws here aborts the rest
+    // of registerConnection and the connection's read loop is never
+    // started. That is exactly what happened when this callback also
+    // rebuilt a connected-ID set: every link was registered but never
+    // listened on, so no traffic flowed and the peer redialled every 2s.
+    // Per-row status is derived in deviceRows() instead.
     syncManager.onConnectionsChanged((count: number) => {
       this.connectedCount = count;
     });
@@ -347,7 +458,7 @@ struct Index {
         });
     });
     this.tcpServer.start(TCP_PORT).catch((e: BusinessError) => {
-      this.syncLog = [`TCP server error: ${e.message}`, ...this.syncLog].slice(0, 30);
+      this.log(`TCP server error: ${e.message}`);
     });
 
     this.discovery.onPeerDiscovered((beacon: PeerBeacon) => {
@@ -369,7 +480,13 @@ struct Index {
       this.ownDeviceId = id;
       netLog(`ownDeviceId=${id}`);
       this.refreshPairingPayload();
-      void this.discovery.start(id, TCP_PORT, () => this.cachedProof, () => this.tailscaleIp.length > 0 ? this.tailscaleIp : null, () => this.pairingOpen);
+      // Same helper the foreground restart uses, and its failure is
+      // surfaced rather than swallowed - a bind failure here means no
+      // peer is ever discovered, which previously looked like "sync just
+      // doesn't work" with nothing in the log to say why.
+      this.startDiscovery().catch((e: BusinessError) => {
+        this.log(`discovery failed to start: ${e.message}`);
+      });
       void this.refreshPassphraseState();
       // Must run AFTER ownDeviceId is actually set, not just after this
       // .then() is scheduled - reconnectOffLanPeers's tie-breaker compares
@@ -405,13 +522,60 @@ struct Index {
   // is already populated by now (it was set back when the page first
   // appeared), so unlike the cold-start call in aboutToAppear, there's no
   // ordering race to worry about here.
+  //
+  // reconnectOffLanPeers alone only re-dials trusted peers with a cached
+  // off-LAN (e.g. Tailscale) address - it has no path for a same-LAN peer
+  // at all. A same-LAN reconnect is entirely beacon-driven: it only
+  // happens when discovery's own UDP socket delivers a fresh 'message'
+  // event to maybeAutoConnect. If the OS suspended or invalidated that
+  // socket while the app was backgrounded (this app requests no
+  // continuousTask grant, so it has no protection from that), it can sit
+  // silently dead, which is why a same-LAN peer could take "seemingly
+  // forever" to reconnect after foregrounding.
+  //
+  // The restart MUST be sequenced, not fire-and-forget. An earlier version
+  // called stop() (which did not await its socket close) and then start()
+  // on the next line; the new bind hit the still-open fixed port, threw
+  // EADDRINUSE, and because the call was `void`-ed nothing retried - so
+  // discovery died on the FIRST foreground and stayed dead, taking
+  // clipboard sync with it. stop() now awaits the close, this awaits
+  // stop(), and a failed bind is retried once rather than swallowed.
   onPageShow(): void {
+    void this.restartDiscovery();
     void this.reconnectOffLanPeers();
+  }
+
+  private async restartDiscovery(): Promise<void> {
+    if (this.ownDeviceId.length === 0) return;
+    await this.discovery.stop();
+    try {
+      await this.startDiscovery();
+    } catch (e) {
+      const be = e as BusinessError;
+      this.log(`discovery restart failed (${be.message}) - retrying`);
+      setTimeout(() => {
+        this.startDiscovery().catch((retryErr: BusinessError) => {
+          this.log(`discovery restart retry failed: ${retryErr.message}`);
+        });
+      }, 1000);
+    }
+  }
+
+  // Single definition of how discovery is started, so the cold-start path
+  // and the foreground-restart path cannot drift apart.
+  private startDiscovery(): Promise<void> {
+    return this.discovery.start(
+      this.ownDeviceId,
+      TCP_PORT,
+      () => this.cachedProof,
+      () => this.tailscaleIp.length > 0 ? this.tailscaleIp : null,
+      () => this.pairingOpen,
+    );
   }
 
   aboutToDisappear(): void {
     this.watcher.stopListening();
-    this.discovery.stop();
+    void this.discovery.stop();
     this.tcpServer.stop();
     if (this.offLanReconnectTimerId !== -1) {
       clearInterval(this.offLanReconnectTimerId);
@@ -419,30 +583,55 @@ struct Index {
     }
   }
 
-  // System/gesture back button - without this it always exits the app,
-  // even when we're inside our own internal "pages" (the full-screen item
-  // detail view, or a Me sub-screen). Returning true tells the framework
-  // we handled it ourselves; returning false lets the default behavior
-  // (exit) proceed, which is what we want once we're already back at a
-  // top-level tab with nothing further to unwind.
+  // System/gesture back button for the item-detail view and Me sub-screens
+  // used to be handled here, since both were plain @State-driven overlays
+  // with no real back-stack concept. Now that both are real NavDestinations
+  // (see syncedPageMap/mePageMap), each one's own .onBackPressed() handler
+  // intercepts system back before it would ever reach this page-level
+  // hook - closeItemDetail/setMeScreen('main') are called from there
+  // instead, via the same animateTo-wrapped pop this uses for the visible
+  // back buttons. Nothing left here needs handling; false lets the
+  // system's default (exit) behavior proceed once at a top-level tab.
   onBackPress(): boolean {
-    if (this.selectedItemId.length > 0) {
-      this.closeItemDetail();
-      return true;
-    }
-    if (this.meScreen !== 'main') {
-      this.setMeScreen('main');
-      return true;
-    }
     return false;
   }
 
   // Every navigation into/out of the Me tab's sub-screens goes through
   // this - not just a plain field assignment - because leaving/entering
   // 'pairing' has to flip pairingOpen in lockstep (see its own doc comment).
+  // Also drives the real push/pop on meNavStack, since immersive material
+  // requires the back button to live in an actual NavDestination title bar
+  // (see mePageMap) rather than plain content - this single call site is
+  // what keeps meScreen/pairingOpen and the nav stack in sync regardless of
+  // whether a sub-screen is entered via settingsRow's onTap or left via its
+  // own title bar back button / a system back gesture (onBackPressed).
+  // Set when pairing was opened from the Devices tab's + button rather
+  // than from Me, so backing out of pairing returns to where it started
+  // instead of stranding the user on a Me screen they never opened.
+  @State pairingReturnTab: number = -1;
+
+  private openPairingFromDevices(): void {
+    this.pairingReturnTab = this.currentTabIndex;
+    this.currentTabIndex = 2;
+    this.setMeScreen('pairing');
+  }
+
   private setMeScreen(screen: 'main' | 'pairing' | 'passcode' | 'network' | 'diagnostics' | 'log'): void {
+    const previous = this.meScreen;
     this.meScreen = screen;
     this.pairingOpen = screen === 'pairing';
+    if (screen === 'main' && previous !== 'main') {
+      this.meNavStack.pop(true);
+      if (this.pairingReturnTab >= 0) {
+        this.currentTabIndex = this.pairingReturnTab;
+        this.pairingReturnTab = -1;
+      }
+    } else if (screen !== 'main' && previous === 'main') {
+      this.meNavStack.pushPath({ name: screen }, true);
+    }
+    // No sub-screen ever navigates directly to another sub-screen (every
+    // one's back button returns to 'main' first) - so those are the only
+    // two transitions this needs to handle.
   }
 
   private async refreshTrustedDevices(): Promise<void> {
@@ -509,6 +698,13 @@ struct Index {
   private handleNewConnection(peerConn: PeerConnection, address: string | null): void {
     netLog(`handleNewConnection: peer=${peerConn.peerDeviceId.slice(0, 16)}... address=${address ?? 'null'} wasAlreadyTrusted=${peerConn.wasAlreadyTrusted} newlyTrustedViaPassphrase=${peerConn.newlyTrustedViaPassphrase}`);
     if (peerConn.wasAlreadyTrusted) {
+      // Registered FIRST, before any trust-store write or activity-log
+      // append. Those are conveniences; starting the connection's read
+      // loop is not. Doing them first meant that if any of them threw,
+      // registerConnection was skipped entirely - the link stayed
+      // unregistered and unlistened, isConnected() stayed false, and the
+      // peer redialled every 2s forever while no clipboard data moved.
+      this.syncManager?.registerConnection(peerConn);
       if (peerConn.newlyTrustedViaPassphrase) {
         // The handshake itself carried a matching passphrase proof - same
         // auto-trust the LAN beacon already does passively, just over a
@@ -517,7 +713,7 @@ struct Index {
         // need the passphrase proof again.
         const context = getContext(this) as common.UIAbilityContext;
         void this.trustStore.trust(context, peerConn.peerDeviceId, address ?? undefined).then(() => { void this.refreshTrustedDevices(); });
-        this.syncLog = [`auto-paired via passcode: ${peerConn.peerDeviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+        this.log(`auto-paired via passcode: ${peerConn.peerDeviceId.slice(0, 12)}...`);
       } else {
         if (address !== null) {
           // Already trusted, but now we know a real address for this peer
@@ -531,9 +727,8 @@ struct Index {
           const context = getContext(this) as common.UIAbilityContext;
           void this.trustStore.trust(context, peerConn.peerDeviceId, address).then(() => { void this.refreshTrustedDevices(); });
         }
-        this.syncLog = [`connected: ${peerConn.peerDeviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+        this.log(`connected: ${peerConn.peerDeviceId.slice(0, 12)}...`);
       }
-      this.syncManager?.registerConnection(peerConn);
       return;
     }
     if (this.pendingPairingConn !== null) {
@@ -565,7 +760,7 @@ struct Index {
     this.pendingPairingConn = null;
     this.pendingPairingPeerId = '';
     this.pendingPairingAddress = '';
-    this.syncLog = [`paired: ${conn.peerDeviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+    this.log(`paired: ${conn.peerDeviceId.slice(0, 12)}...`);
     this.syncManager?.registerConnection(conn);
     promptAction.showToast({ message: 'Paired.' });
   }
@@ -585,13 +780,13 @@ struct Index {
       const conn = await PeerConnection.create(new TcpSocketAdapter(client), identity, this.trustStore, context, this.pairingOpen, this.passphraseKeyStore);
       if (conn === null) {
         client.close().catch(() => { /* already closed - fine */ });
-        this.syncLog = [`connect failed: ${beacon.deviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+        this.log(`connect failed: ${beacon.deviceId.slice(0, 12)}...`);
         return;
       }
       this.handleNewConnection(conn, beacon.senderIp);
     } catch (e) {
       const be = e as BusinessError;
-      this.syncLog = [`connect error (${beacon.senderIp}:${beacon.tcpPort}): ${be.message}`, ...this.syncLog].slice(0, 30);
+      this.log(`connect error (${beacon.senderIp}:${beacon.tcpPort}): ${be.message}`);
     }
   }
 
@@ -692,7 +887,7 @@ struct Index {
     // reappears as "discovered" with a Trust button instead of "trusted"
     // with Remove) - without this, tapping Remove on a device that's still
     // on the LAN looks like it silently did nothing.
-    this.syncLog = [`untrusted ${deviceId.slice(0, 12)}...`, ...this.syncLog].slice(0, 30);
+    this.log(`untrusted ${deviceId.slice(0, 12)}...`);
     promptAction.showToast({ message: `Removed ${deviceId.slice(0, 12)}...` });
   }
 
@@ -786,7 +981,7 @@ struct Index {
     if (key === null) return;
     const verified = await this.passphraseKeyStore.verifyProof(key, beacon.deviceId, beacon.proof);
     if (!verified) return;
-    this.syncLog = [`auto-trusting ${beacon.deviceId.slice(0, 12)}... (shared passcode)`, ...this.syncLog].slice(0, 30);
+    this.log(`auto-trusting ${beacon.deviceId.slice(0, 12)}... (shared passcode)`);
     await this.trustStore.trust(context, beacon.deviceId, beacon.address ?? undefined);
     await this.refreshTrustedDevices();
   }
@@ -806,6 +1001,35 @@ struct Index {
   // in the first place if the OTHER device's Pairing screen is open too
   // (see PeerConnection.create's relaxed gate), so scanning someone's code
   // alone can no longer trust them unilaterally the way it used to.
+  // Every address worth trying for a peer, best-first. A QR code (and the
+  // trust store) carries whatever the peer ADVERTISES for itself, which is
+  // its Tailscale IP when it has one configured - and that address is
+  // useless if Tailscale isn't up on THIS device. Any LAN address we've
+  // actually received a beacon from is both more likely to work and
+  // cheaper, so it goes first.
+  private addressCandidatesFor(deviceId: string, advertised: string | undefined): string[] {
+    const candidates: string[] = [];
+    if (deviceId.length > 0) {
+      for (const b of this.receivedBeacons) {
+        if (b.deviceId !== deviceId) continue;
+        if (b.senderIp.length > 0 && !candidates.includes(b.senderIp)) candidates.push(b.senderIp);
+      }
+    }
+    if (advertised !== undefined && advertised.length > 0 && !candidates.includes(advertised)) {
+      candidates.push(advertised);
+    }
+    return candidates;
+  }
+
+  // Tries each candidate in order, returning the first that connects.
+  private async connectToFirstReachable(candidates: string[], port: number): Promise<string | null> {
+    for (const addr of candidates) {
+      const connected = await this.connectToAddress(addr, port);
+      if (connected) return addr;
+    }
+    return null;
+  }
+
   async scanToPair(): Promise<void> {
     const context = getContext(this) as common.UIAbilityContext;
     try {
@@ -827,11 +1051,12 @@ struct Index {
         this.scanStatus = `${publicKey.slice(0, 12)}... has no address in its code - if it's on the same network, just keep this screen open and its beacon will trigger pairing automatically.`;
         return;
       }
-      this.scanStatus = `Connecting to ${address}...`;
-      const connected = await this.connectToAddress(address, TCP_PORT);
-      this.scanStatus = connected
-        ? `Reached ${address} - accept the pairing prompt on both devices to finish.`
-        : `Could not reach ${address} - make sure the other device's Pairing screen is open too.`;
+      const candidates = this.addressCandidatesFor(publicKey, address);
+      this.scanStatus = `Connecting to ${candidates[0]}...`;
+      const reached = await this.connectToFirstReachable(candidates, TCP_PORT);
+      this.scanStatus = reached !== null
+        ? `Reached ${reached} - accept the pairing prompt on both devices to finish.`
+        : `Could not reach ${candidates.join(' or ')} - make sure the other device's Pairing screen is open too.`;
     } catch (e) {
       const be = e as BusinessError;
       if (be.code === 1000500002) {
@@ -855,21 +1080,28 @@ struct Index {
       return;
     }
     let address = raw;
+    let pastedKey = '';
     try {
       const parsed = JSON.parse(raw) as PairingInfo;
       if (typeof parsed.Address === 'string' && parsed.Address.length > 0) {
         address = parsed.Address;
+      }
+      if (typeof parsed.PublicKey === 'string') {
+        pastedKey = parsed.PublicKey;
       }
     } catch (e) {
       // not JSON - treat the raw input as a bare address
     }
     this.pairingInProgress = true;
     try {
-      const connected = await this.connectToAddress(address, TCP_PORT);
+      // Same LAN-first ordering as scanToPair - pasted pairing text carries
+      // the peer's advertised (often Tailscale) address too.
+      const candidates = this.addressCandidatesFor(pastedKey, address);
+      const reached = await this.connectToFirstReachable(candidates, TCP_PORT);
       promptAction.showToast({
-        message: connected
-          ? `Reached ${address} - accept the pairing prompt on both devices to finish.`
-          : `Could not reach ${address} - make sure the other device's Pairing screen is open too.`,
+        message: reached !== null
+          ? `Reached ${reached} - accept the pairing prompt on both devices to finish.`
+          : `Could not reach ${candidates.join(' or ')} - make sure the other device's Pairing screen is open too.`,
         duration: 3000,
       });
     } finally {
@@ -995,6 +1227,81 @@ struct Index {
   // SaveButton, this is a normal API call, not gated behind a security
   // component. Images get materialized to a temp file first since
   // systemShare needs a URI, not raw base64.
+  // Hands a stored file to the system so the user can actually open it.
+  // Two tiers, because neither alone covers everything:
+  //   1. Preview Kit's openPreview - the real "view this file" surface on
+  //      HarmonyOS NEXT (pdf/office/txt/html/av/images). canPreview tells
+  //      us up front whether it will take the file.
+  //   2. An implicit Want with ohos.want.action.viewData for anything
+  //      Preview Kit declines, so a third-party handler can claim it.
+  // The action is written as a literal on purpose: ACTION_VIEW_DATA only
+  // exists on the DEPRECATED @ohos.ability.wantConstant; the modern
+  // @ohos.app.ability.wantConstant.Action enum has just ACTION_SEND_TO_DATA.
+  // FLAG_AUTH_READ_URI_PERMISSION is the only public way to lend another
+  // app read access to a file in this sandbox - grantUriPermission is
+  // system-api only.
+  // A card with something to show opens the in-app detail view; a file we
+  // cannot preview has nothing to show, so hand it straight to the system
+  // instead of opening an empty viewer.
+  private activateItem(item: SyncedItem): void {
+    if (item.type === 'file' && this.imagePreviewUri(item) === null) {
+      void this.openFileWithSystem(item);
+      return;
+    }
+    this.openItemDetail(item);
+  }
+
+  async openFileWithSystem(item: SyncedItem): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    const fileStore = this.fileStore;
+    if (fileStore === null) {
+      promptAction.showToast({ message: 'File store not ready — try again.' });
+      return;
+    }
+    let payload: FilePayload;
+    try {
+      payload = JSON.parse(item.content) as FilePayload;
+    } catch (e) {
+      promptAction.showToast({ message: 'That item is not a file.' });
+      return;
+    }
+    if (!fileStore.exists(payload.FileHash)) {
+      promptAction.showToast({ message: "File hasn't finished downloading yet." });
+      return;
+    }
+    const uri: string = fileUri.getUriFromPath(fileStore.getPath(payload.FileHash));
+    const mime: string = mimeTypeForFileName(payload.FileName);
+
+    if (canIUse('SystemCapability.FileManagement.FilePreview.Core')) {
+      try {
+        const previewable: boolean = await filePreview.canPreview(context, uri);
+        if (previewable) {
+          await filePreview.openPreview(context, { title: payload.FileName, uri: uri, mimeType: mime });
+          return;
+        }
+      } catch (e) {
+        // fall through to the implicit Want
+      }
+    }
+
+    const want: Want = {
+      action: 'ohos.want.action.viewData',
+      uri: uri,
+      type: mime,
+      flags: wantConstant.Flags.FLAG_AUTH_READ_URI_PERMISSION | wantConstant.Flags.FLAG_START_WITHOUT_TIPS,
+    };
+    try {
+      await context.startAbility(want);
+    } catch (e) {
+      const err = e as BusinessError;
+      if (err.code === 16000019 || err.code === 16000001) {
+        promptAction.showToast({ message: `No app on this device can open ${payload.FileName}.` });
+      } else {
+        promptAction.showToast({ message: `Could not open file (${err.code}).` });
+      }
+    }
+  }
+
   async shareItem(item: SyncedItem): Promise<void> {
     const context = getContext(this) as common.UIAbilityContext;
     try {
@@ -1211,49 +1518,109 @@ struct Index {
     this.imageOffsetY = 0;
     this.imageOffsetBaseX = 0;
     this.imageOffsetBaseY = 0;
+    // Set BEFORE the push, not inside animateTo like the old selectedItemId
+    // assignment was - the 'itemDetail' NavDestination's builder (see
+    // syncedPageMap) reads this synchronously the moment the push mounts
+    // it, so it has to already be correct by then.
+    this.selectedItemId = item.id;
+    // Per Huawei's own Navigation shared-element-transition guide
+    // (arkts-navigation-animation#共享元素转场): the push call itself must run
+    // inside animateTo, and pushPath's own default transition must be
+    // disabled (the `false` argument) so it doesn't layer on top of the
+    // geometryTransition-driven animation and produce a broken double
+    // animation.
     this.getUIContext().animateTo({ curve: curves.interpolatingSpring(0, 1, 328, 36) }, () => {
-      this.selectedItemId = item.id;
+      this.syncedNavStack.pushPath({ name: 'itemDetail' }, false);
     });
   }
 
   closeItemDetail(): void {
     this.getUIContext().animateTo({ curve: curves.interpolatingSpring(0, 1, 328, 36) }, () => {
-      this.selectedItemId = '';
+      this.syncedNavStack.pop(false);
     });
+  }
+
+  // Reads syncManager.isConnected() directly; connectedCount changing is
+  // what re-runs this builder
+  // for why: that used to only "live update" incidentally, as a side
+  // effect of being called inside the same @Builder that also reads
+  // connectedCount.
+  // Every activity-log line goes through here so each one carries a
+  // wall-clock time to the second. The log was previously bare strings
+  // with no time at all, which made it useless for working out the order
+  // or spacing of events.
+  private log(message: string): void {
+    const d = new Date();
+    const hh = d.getHours().toString().padStart(2, '0');
+    const mm = d.getMinutes().toString().padStart(2, '0');
+    const ss = d.getSeconds().toString().padStart(2, '0');
+    // Writes syncLog DIRECTLY. This must never call this.log() - doing so
+    // recurses forever and every caller dies of a stack overflow, which is
+    // precisely what silently killed connection registration and the paste
+    // button when the timestamp rewrite accidentally replaced this line.
+    this.syncLog = [`${hh}:${mm}:${ss}  ${message}`, ...this.syncLog].slice(0, 30);
   }
 
   private deviceRows(): DeviceRow[] {
     const rows = new Map<string, DeviceRow>();
+    // Accumulates rather than overwrites - see DeviceRow.addresses.
+    const addAddress = (row: DeviceRow, value: string | null | undefined): void => {
+      if (value === null || value === undefined) return;
+      const v: string = value.trim();
+      if (v.length === 0) return;
+      if (!row.addresses.includes(v)) row.addresses.push(v);
+      if (row.address === null) row.address = v;
+    };
     for (const t of this.trustedDevices) {
-      rows.set(t.publicKey, {
+      const row: DeviceRow = {
         deviceId: t.publicKey,
-        address: t.address ?? null,
+        addresses: [],
+        address: null,
         trusted: true,
         discovered: false,
         tcpPort: null,
-        connected: this.syncManager?.isConnected(t.publicKey) === true,
-      });
+        connected: this.syncManager?.isConnected(t.publicKey) ?? false,
+      };
+      addAddress(row, t.address);
+      rows.set(t.publicKey, row);
     }
     for (const b of this.receivedBeacons) {
       if (b.deviceId === this.ownDeviceId) continue;
-      const existing = rows.get(b.deviceId);
-      if (existing) {
-        existing.discovered = true;
-        existing.tcpPort = b.tcpPort;
-        existing.address = b.senderIp;
-        existing.connected = this.syncManager?.isConnected(b.deviceId) === true;
-      } else {
-        rows.set(b.deviceId, {
+      let row = rows.get(b.deviceId);
+      if (row === undefined) {
+        row = {
           deviceId: b.deviceId,
-          address: b.senderIp,
+          addresses: [],
+          address: null,
           trusted: false,
           discovered: true,
           tcpPort: b.tcpPort,
-          connected: false,
-        });
+          connected: this.syncManager?.isConnected(b.deviceId) ?? false,
+        };
+        rows.set(b.deviceId, row);
       }
+      row.discovered = true;
+      row.tcpPort = b.tcpPort;
+      row.connected = this.syncManager?.isConnected(b.deviceId) ?? false;
+      // senderIp is where the packet really came from; b.address is what
+      // the peer advertises for itself (its Tailscale IP when configured).
+      addAddress(row, b.senderIp);
+      addAddress(row, b.address);
     }
     return Array.from(rows.values());
+  }
+
+  // Human-readable label for whichever device an item came from. A raw
+  // public key fragment ("MFkwEwYHKoZI...") was being used as the card's
+  // byline, which is both meaningless to read and visually identical for
+  // every peer. Prefer the peer's address, fall back to a plain phrase.
+  private sourceLabelFor(deviceId: string): string {
+    if (deviceId === this.ownDeviceId) return 'This device';
+    const known = this.trustedDevices.find(d => d.publicKey === deviceId);
+    if (known !== undefined && known.address !== undefined && known.address.length > 0) {
+      return known.address;
+    }
+    return 'Other device';
   }
 
   private materialCard(): uiMaterial.ImmersiveMaterial {
@@ -1270,6 +1637,7 @@ struct Index {
     return new uiMaterial.ImmersiveMaterial({
       style: uiMaterial.ImmersiveStyle.THIN,
       interactive: true,
+      colorInvert: true,
       lightEffect: { color: $r('sys.color.brand') },
     });
   }
@@ -1279,22 +1647,87 @@ struct Index {
   // behind menu text.
   private menuMaterial(): uiMaterial.ImmersiveMaterial {
     return new uiMaterial.ImmersiveMaterial({
-      style: uiMaterial.ImmersiveStyle.THICK,
+      style: uiMaterial.ImmersiveStyle.THIN,
       interactive: true,
       lightEffect: { color: $r('sys.color.brand') },
     });
   }
 
-  private typeCardBackground(type: string): ResourceColor {
-    if (type === 'image') return '#F3E8FF';
-    if (type === 'file') return '#FFF4E5';
-    return '#EAF2FF'; // text
+  // ---------------------------------------------------------------------
+  // Design tokens.
+  //
+  // Every color here is either a sys.color.* token (which the system
+  // re-resolves per light/dark theme automatically) or a saturated chip
+  // fill that carries its own white glyph. That split is deliberate: the
+  // old scheme tinted the whole CARD per type (#EAF2FF/#F3E8FF/#FFF4E5)
+  // and colored the preview TEXT to match, so in dark mode the text
+  // followed the theme to near-white while the card stayed a fixed pale
+  // tint - white on cream, i.e. invisible. Surfaces and text now come
+  // exclusively from tokens; type identity moved onto a small solid icon
+  // chip, which stays legible against any background in either theme
+  // because it supplies both its own fill and its own contrast.
+  // ---------------------------------------------------------------------
+
+  // Card/surface for a synced item - one neutral token for every type.
+  private cardSurface(): ResourceColor {
+    return $r('sys.color.comp_background_list_card');
   }
 
-  private typeAccentColor(type: string): ResourceColor {
-    if (type === 'image') return '#9333EA';
-    if (type === 'file') return '#C2790A';
-    return $r('sys.color.brand');
+  // Solid fill behind a type's glyph. These stay literal rather than
+  // tokenized: there is no purple/amber in the system palette, and a
+  // saturated chip with a white glyph needs no theme adaptation - it is
+  // its own contrast pair in both modes (the same reason iOS-style
+  // settings icons are fixed colors).
+  private typeChipColor(kind: string): ResourceColor {
+    if (kind === 'image') return '#9333EA';
+    if (kind === 'file') return '#D97706';
+    if (kind === 'link') return '#0891B2';
+    if (kind === 'key') return '#64748B';
+    return '#2563EB'; // plain text
+  }
+
+  // Icon for a content type. 'link' and 'key' are display-only refinements
+  // of a 'text' entry (see chipKindFor) - the sync protocol itself only
+  // knows text/image/file.
+  private typeIcon(kind: string): Resource {
+    if (kind === 'image') return $r('app.media.ic_chip_image');
+    if (kind === 'file') return $r('app.media.ic_chip_file');
+    if (kind === 'link') return $r('app.media.ic_chip_link');
+    if (kind === 'key') return $r('app.media.ic_chip_key');
+    return $r('app.media.ic_chip_text');
+  }
+
+  // Narrows a stored item down to the chip it should show. A URL and a raw
+  // key blob are both stored as 'text' but are worth telling apart at a
+  // glance - they were previously indistinguishable.
+  // List rows get the short preview; grid cells are tall enough to show
+  // the real body, which is what the 80-char preview was hiding behind an
+  // ellipsis. Capped so one long note cannot blow past itemConstraintSize.
+  private cardBodyText(item: SyncedItem): string {
+    if (this.syncedViewMode === 'list' || item.type !== 'text') return item.preview;
+    const full: string = item.content;
+    return full.length > 280 ? `${full.slice(0, 280)}...` : full;
+  }
+
+  private chipKindFor(item: SyncedItem): string {
+    if (item.type === 'image') return 'image';
+    if (item.type === 'file') return 'file';
+    if (this.looksLikeOpaqueData(item.preview)) return 'key';
+    const t: string = item.preview.trim();
+    if (t.startsWith('http://') || t.startsWith('https://')) return 'link';
+    return 'text';
+  }
+
+  // True when a preview is machine noise rather than something a human
+  // copied on purpose - a key, hash, token or base64 blob. Long, unbroken,
+  // and drawn only from a hex/base64-ish alphabet. These dominated the
+  // list visually while carrying almost no scannable information, so the
+  // card renders them as a labeled, monospaced, single-line fragment
+  // instead of two lines of raw characters.
+  private looksLikeOpaqueData(text: string): boolean {
+    if (text.length < 40) return false;
+    if (text.includes(' ')) return false;
+    return /^[A-Za-z0-9+/=_-]+\.{0,3}$/.test(text);
   }
 
   // Real official long-press menu (bindContextMenu, confirmed to support
@@ -1308,61 +1741,114 @@ struct Index {
   itemActionMenu(item: SyncedItem) {
     Menu() {
       if (item.type === 'text') {
-        MenuItem({ content: 'Copy' }).onClick(() => { this.copyItemContent(item); })
+        // Colour is baked into these assets, like every other icon here -
+        // see settingsRow for why (.fillColor cannot reach stroke-drawn
+        // art). MenuItem is the strictest case of it: MenuItemOptions has
+        // no colour field at all, so even a fill-based icon could not be
+        // tinted from code. The light/dark resource pair is what makes it
+        // adapt.
+        MenuItem({ content: 'Copy', startIcon: $r('app.media.ic_menu_copy') }).onClick(() => { tapHaptic(); this.copyItemContent(item); })
       } else {
-        MenuItem({ content: 'Share' }).onClick(() => { void this.shareItem(item); })
+        MenuItem({ content: 'Share', startIcon: $r('app.media.ic_menu_share') }).onClick(() => { tapHaptic(); void this.shareItem(item); })
         if (item.type === 'image') {
-          MenuItem({ content: 'Save to gallery' }).onClick(() => { this.showSaveImageDialog(item); })
+          MenuItem({ content: 'Save to gallery', startIcon: $r('app.media.ic_menu_save_gallery') }).onClick(() => { tapHaptic(); this.showSaveImageDialog(item); })
         } else {
-          MenuItem({ content: 'Save file' }).onClick(() => { void this.saveFileToDocuments(item); })
+          MenuItem({ content: 'Open', startIcon: $r('app.media.ic_menu_save_file') }).onClick(() => { tapHaptic(); void this.openFileWithSystem(item); })
+          MenuItem({ content: 'Save file', startIcon: $r('app.media.ic_menu_save_file') }).onClick(() => { tapHaptic(); void this.saveFileToDocuments(item); })
         }
       }
+    }
+  }
+
+  // Small square chip carrying a type's identity - a real thumbnail when
+  // the item has an image, otherwise a solid colored tile with a glyph.
+  // Shared by the list card and (at a larger size) nothing else, so the
+  // size is a parameter rather than a second near-duplicate builder.
+  @Builder
+  typeChip(item: SyncedItem, size: number) {
+    if (item.type === 'image') {
+      Image(`data:image/png;base64,${item.content}`)
+        .width(size)
+        .height(size)
+        .borderRadius(size / 3.2)
+        .objectFit(ImageFit.Cover)
+    } else if (this.imagePreviewUri(item) !== null) {
+      Image(this.imagePreviewUri(item) as string)
+        .width(size)
+        .height(size)
+        .borderRadius(size / 3.2)
+        .objectFit(ImageFit.Cover)
+    } else {
+      Stack() {
+        // White is baked into the chip SVGs rather than applied with
+        // .fillColor(), which does not reach stroke-drawn art (see the
+        // settingsRow note). These sit on a saturated chip fill that does
+        // not change between themes, so one fixed white asset is correct.
+        Image(this.typeIcon(this.chipKindFor(item)))
+          .width(size * 0.52)
+          .height(size * 0.52)
+      }
+      .width(size)
+      .height(size)
+      .backgroundColor(this.typeChipColor(this.chipKindFor(item)))
+      .borderRadius(size / 3.2)
     }
   }
 
   @Builder
   syncedItemCard(item: SyncedItem) {
     Row({ space: 12 }) {
-      if (item.type === 'image') {
-        Image(`data:image/png;base64,${item.content}`)
-          .width(44)
-          .height(44)
-          .borderRadius(12)
-          .objectFit(ImageFit.Cover)
-      } else if (item.type === 'file' && this.imagePreviewUri(item) !== null) {
-        Image(this.imagePreviewUri(item) as string)
-          .width(44)
-          .height(44)
-          .borderRadius(12)
-          .objectFit(ImageFit.Cover)
-      } else if (item.type === 'file') {
-        Text('📄')
-          .fontSize(18)
-          .width(44)
-          .height(44)
-          .textAlign(TextAlign.Center)
-          .backgroundColor('#fdba74')
-          .borderRadius(12)
-      } else {
-        Text(item.type.slice(0, 1).toUpperCase())
-          .fontSize(14)
-          .fontWeight(FontWeight.Bold)
-          .fontColor(Color.White)
-          .width(44)
-          .height(44)
-          .textAlign(TextAlign.Center)
-          .backgroundColor(this.typeAccentColor(item.type))
-          .borderRadius(12)
-      }
+      this.typeChip(item, 44)
 
       Column({ space: 3 }) {
-        Text(item.preview)
-          .fontSize(14)
-          .fontColor(this.typeAccentColor(item.type))
-          .fontWeight(FontWeight.Medium)
-          .maxLines(2)
+        if (this.looksLikeOpaqueData(item.preview)) {
+          // Machine noise: label what it is, then show a short fragment
+          // rather than two lines of characters nobody can read. The full
+          // value is still one tap away in the detail view.
+          Text(item.type === 'file' ? 'File' : 'Encoded data')
+            .fontSize(14)
+            .fontColor($r('sys.color.font_primary'))
+            .fontWeight(FontWeight.Medium)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text(item.preview.slice(0, 24))
+            .fontSize(11)
+            .fontColor($r('sys.color.font_tertiary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .wordBreak(WordBreak.BREAK_ALL)
+        } else {
+          Text(this.cardBodyText(item))
+            .fontSize(14)
+            // font_primary, not the type accent - a themed token that
+            // inverts with the background instead of a fixed accent that
+            // could land the same color as whatever is behind it.
+            .fontColor($r('sys.color.font_primary'))
+            .fontWeight(FontWeight.Medium)
+            // Grid cells are narrow but tall, so 2 lines truncated almost
+            // every note to an ellipsis. Show the body instead, capped so
+            // one long note can't grow a cell past itemConstraintSize.
+            .maxLines(this.syncedViewMode === 'list' ? 2 : 8)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            // BREAK_WORD (the default) for prose - BREAK_ALL here was
+            // splitting ordinary words mid-character ("bro/wn fox",
+            // "develo/per.huawei"). The unbreakable-blob case that
+            // originally motivated BREAK_ALL no longer reaches this
+            // branch: looksLikeOpaqueData catches it above and renders a
+            // short labeled fragment instead.
+            .wordBreak(WordBreak.BREAK_WORD)
+        }
+        // This builder is ALSO the grid fallback for every non-image item
+        // (see syncedGridCard), where a half-width cell can't fit
+        // "time · source" and truncated it to a meaningless "20:53 · ...".
+        // Drop the source in grid; the list has room for it.
+        Text(this.syncedViewMode === 'list' ? `${item.time} · ${item.source}` : item.time)
+          .fontSize(11)
+          .fontColor($r('sys.color.font_secondary'))
+          // One line, always - a byline that wraps competes with the
+          // content preview above it for the eye.
+          .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Text(`${item.source} · ${item.time}`).fontSize(11).fontColor('#888888')
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
@@ -1370,8 +1856,16 @@ struct Index {
     .width('100%')
     .padding(12)
     .borderRadius(18)
-    .backgroundColor(this.typeCardBackground(item.type))
+    .backgroundColor(this.cardSurface())
     .alignItems(VerticalAlign.Center)
+    // Per the official Shape Clipping reference: a child that still ends
+    // up measuring wider than its parent (e.g. any other future
+    // unbreakable content) is NOT clipped to the parent's bounds by
+    // default - it paints straight through. Explicit clip(true) is the
+    // defense-in-depth backstop so a card can never bleed into its
+    // WaterFlow neighbor regardless of content, matching Huawei's own
+    // example of pairing clip(true) with borderRadius.
+    .clip(true)
     // Shared id with itemDetailView below - this is what makes the card
     // visually morph into the full-screen view instead of just cutting
     // between them ("一镜到底").
@@ -1381,7 +1875,7 @@ struct Index {
     // tappable surface (including file cards, which don't navigate
     // anywhere) gets identical feedback.
     .clickEffect({ level: ClickEffectLevel.MIDDLE })
-    .onClick(() => { this.openItemDetail(item); })
+    .onClick(() => { tapHaptic(); this.activateItem(item); })
     // Lets a card be dragged straight out into another app (e.g. dropping
     // a synced image into a chat) - draggable() + onDragStart() are the
     // universal attribute pair every draggable component uses (confirmed
@@ -1410,6 +1904,10 @@ struct Index {
     .bindContextMenu(this.itemActionMenu(item), ResponseType.LongPress, {
       systemMaterial: this.menuMaterial(),
       hapticFeedbackMode: HapticFeedbackMode.ENABLED,
+      // See syncedGridCard's identical options for why preview is set.
+      preview: MenuPreviewMode.IMAGE,
+      previewBorderRadius: 18,
+      targetSpace: LengthMetrics.vp(12),
     })
   }
 
@@ -1417,46 +1915,151 @@ struct Index {
   // (native 'image' type, or a 'file' entry imagePreviewUri recognizes)
   // gets the photo featured full-width on top with the caption below,
   // instead of the same fixed 44x44 thumbnail every card uses in list
-  // mode. Deliberately doesn't set a height on the Image: with only width
-  // set, ArkUI sizes it by the image's own aspect ratio, so a portrait
-  // photo's card ends up taller than a landscape one's - that varying
-  // per-card height is what makes WaterFlow actually lay out as a masonry
-  // grid instead of a uniform one. Non-image items don't get this
-  // treatment - the compact row card already fits a 2-column cell fine
-  // without manufacturing a fake masonry effect for plain text.
+  // mode. Image now gets an explicit .height(220) alongside
+  // constraintSize's maxHeight, not maxHeight alone - per the official
+  // WaterFlow reference, "When the main axis size of a FlowItem changes
+  // after it is displayed, WaterFlow clears the affected layout
+  // information and recalculates..."; a base64 Image decodes
+  // asynchronously, so its intrinsic size (and therefore its FlowItem's
+  // measured size) still changes once, after the initial layout pass,
+  // even with a maxHeight cap on top of it - that's what was letting a
+  // card's box visually bridge into its neighboring WaterFlow column
+  // (confirmed via on-device pixel measurement: the column gap band
+  // between two cards vanished exactly where a larger image card sat). A
+  // fixed .height() removes that async-driven change at the source
+  // instead of just capping its result. ImageFit.Cover crops to fill that
+  // fixed box instead of squeezing/distorting the image. Trade-off: this
+  // gives up the "landscape images end up shorter" masonry height
+  // variety the box used to have - every image card is now a uniform
+  // 220, which cost less than another round of overlapping cards. Non-image
+  // items don't get this treatment - the compact row card already fits a
+  // 2-column cell fine without manufacturing a fake masonry effect for
+  // plain text.
+  // Text-ish card for GRID mode. Deliberately not syncedItemCard: that one
+  // leads with a 44pt chip, which in a half-width cell ate roughly a third
+  // of the line length and forced everything to wrap early. Here the body
+  // gets the full width and the type marker shrinks to a small glyph in
+  // the bottom-left, beside the timestamp.
+  @Builder
+  syncedGridTextCard(item: SyncedItem) {
+    Column({ space: 8 }) {
+      if (this.looksLikeOpaqueData(item.preview)) {
+        Text(item.type === 'file' ? 'File' : 'Encoded data')
+          .fontSize(14)
+          .fontColor($r('sys.color.font_primary'))
+          .fontWeight(FontWeight.Medium)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .width('100%')
+        Text(item.preview.slice(0, 24))
+          .fontSize(11)
+          .fontColor($r('sys.color.font_tertiary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .wordBreak(WordBreak.BREAK_ALL)
+          .width('100%')
+      } else {
+        Text(this.cardBodyText(item))
+          .fontSize(14)
+          .fontColor($r('sys.color.font_primary'))
+          .fontWeight(FontWeight.Medium)
+          .maxLines(8)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .wordBreak(WordBreak.BREAK_WORD)
+          .width('100%')
+      }
+
+      Row({ space: 6 }) {
+        // The chip tile, shrunk - not a bare Image. The chip SVGs have white
+        // baked in (they normally sit on a saturated tile), and fillColor
+        // cannot retint stroke-drawn art, so drawing one directly onto a
+        // white card left it invisible. Keeping the tile keeps the type
+        // colour legible and matches the list card's language.
+        this.typeChip(item, 18)
+        Text(item.time)
+          .fontSize(10)
+          .fontColor($r('sys.color.font_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+    }
+    .width('100%')
+    .padding(12)
+    .borderRadius(18)
+    .backgroundColor(this.cardSurface())
+    .alignItems(HorizontalAlign.Start)
+    .clip(true)
+    .geometryTransition(item.id, { follow: true })
+    .clickEffect({ level: ClickEffectLevel.MIDDLE })
+    .onClick(() => { tapHaptic(); this.activateItem(item); })
+    .draggable(true)
+    .onDragStart((event: DragEvent) => {
+      const data = this.dragDataFor(item);
+      if (data !== null) {
+        event.setData(data);
+      }
+      return { extraInfo: item.preview };
+    })
+    .bindContextMenu(this.itemActionMenu(item), ResponseType.LongPress, {
+      systemMaterial: this.menuMaterial(),
+      hapticFeedbackMode: HapticFeedbackMode.ENABLED,
+      preview: MenuPreviewMode.IMAGE,
+      previewBorderRadius: 18,
+      targetSpace: LengthMetrics.vp(12),
+    })
+  }
+
   @Builder
   syncedGridCard(item: SyncedItem) {
     if (item.type !== 'image' && this.imagePreviewUri(item) === null) {
-      this.syncedItemCard(item)
+      this.syncedGridTextCard(item)
     } else {
       Column({ space: 6 }) {
         Image(item.type === 'image' ? `data:image/png;base64,${item.content}` : this.imagePreviewUri(item) as string)
           .width('100%')
+          .height(220)
+          .constraintSize({ maxHeight: 220 })
+          .objectFit(ImageFit.Cover)
           .borderRadius(12)
-        Text(item.preview)
+        Text(this.looksLikeOpaqueData(item.preview) ? 'Image' : item.preview)
           .fontSize(13)
-          .fontColor(this.typeAccentColor(item.type))
+          .fontColor($r('sys.color.font_primary'))
           .fontWeight(FontWeight.Medium)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
+          // See syncedItemCard's identical comment - wordBreak is what
+          // actually lets textOverflow truncate an unbroken blob instead
+          // of it painting past the card at full width.
+          .wordBreak(WordBreak.BREAK_ALL)
           .padding({ left: 4, right: 4 })
-        Text(`${item.source} · ${item.time}`)
+        // Time only here - the full "time · source" byline does not fit a
+        // half-width grid cell and truncated to a meaningless "· ...".
+        // The source is still on the list card and in the detail view.
+        Text(item.time)
           .fontSize(10)
-          .fontColor('#888888')
+          .fontColor($r('sys.color.font_secondary'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
           .padding({ left: 4, right: 4, bottom: 4 })
       }
       .width('100%')
       .padding(8)
       .borderRadius(18)
-      .backgroundColor(this.typeCardBackground(item.type))
+      .backgroundColor(this.cardSurface())
       .alignItems(HorizontalAlign.Start)
+      // See syncedItemCard's identical comment - clip(true) backstop so
+      // this card can never bleed into its WaterFlow neighbor.
+      .clip(true)
       // Same shared-id morph, click/drag/long-press wiring as
       // syncedItemCard - only one of the two card variants is ever
       // mounted for a given item at a time (list XOR grid mode), so
       // reusing item.id here doesn't conflict with the other variant.
       .geometryTransition(item.id, { follow: true })
       .clickEffect({ level: ClickEffectLevel.MIDDLE })
-      .onClick(() => { this.openItemDetail(item); })
+      .onClick(() => { tapHaptic(); this.activateItem(item); })
       .draggable(true)
       .onDragStart((event: DragEvent) => {
         const data = this.dragDataFor(item);
@@ -1468,6 +2071,17 @@ struct Index {
       .bindContextMenu(this.itemActionMenu(item), ResponseType.LongPress, {
         systemMaterial: this.menuMaterial(),
         hapticFeedbackMode: HapticFeedbackMode.ENABLED,
+        // Without preview, THIS overload of bindContextMenu documents the
+        // menu as appearing "at the click position" - i.e. anchored to the
+        // finger, which is on top of the card, which is why it covered it.
+        // MenuPreviewMode.IMAGE lifts a snapshot of the card and lays the
+        // preview and the menu out as ONE region, so the menu is placed
+        // relative to the card instead of the touch point. previewBorderRadius
+        // matches the card's own 18 so the lifted snapshot doesn't show
+        // different corners from the card beneath it.
+        preview: MenuPreviewMode.IMAGE,
+        previewBorderRadius: 18,
+        targetSpace: LengthMetrics.vp(12),
       })
     }
   }
@@ -1541,6 +2155,23 @@ struct Index {
       )
   }
 
+  // The back button used to be an embedded child of this Stack. It now
+  // lives in the NavDestination's title slot via the shared glassTitleBar
+  // (see syncedPageMap's 'itemDetail' branch), which is what keeps it in
+  // the same place as every other screen's back button. NOTE: an earlier
+  // round of this file claimed systemMaterial only renders inside a
+  // Navigation title bar or a Tabs bottom bar - that is WRONG. Checked
+  // against @ohos.arkui.uiMaterial.d.ts and common.d.ts:22642:
+  // systemMaterial is declared on CommonMethod, so it applies to ANY
+  // component, and is inert only when the app-level MaterialState is
+  // DISABLE or uiMaterial.isImmersiveMaterialSupported() is false. The
+  // title bar is used here for layout/consistency reasons, not because
+  // material would fail elsewhere
+  // instead (see "ohos.arkui.UIMaterial.state" in module.json5 for how it
+  // gets immersive material without any manual styling here). The top
+  // padding below still reserves the same visual space for it, since
+  // BarStyle.STACK makes the title bar float transparently OVER this
+  // content rather than pushing it down.
   @Builder
   itemDetailView(item: SyncedItem) {
     Stack({ alignContent: Alignment.TopStart }) {
@@ -1551,45 +2182,29 @@ struct Index {
           this.zoomableImage(this.imagePreviewUri(item) as string)
         } else {
           Scroll() {
-            Text(item.content).fontSize(16).fontColor(Color.White).copyOption(CopyOptions.LocalDevice)
+            Text(item.content).fontSize(16).fontColor($r('sys.color.font_primary')).copyOption(CopyOptions.LocalDevice)
           }
           .width('100%')
           .layoutWeight(1)
           .align(Alignment.TopStart)
         }
-        Text(`${item.source} · ${item.time}`).fontSize(12).fontColor('#AAAAAA')
+        Text(`${item.time} · ${item.source}`).fontSize(12).fontColor($r('sys.color.font_secondary'))
       }
       .width('100%')
       .height('100%')
-      // Room at the top for the back button, and the same bottom safe-area
-      // reservation every other tab uses (this.bottomInsetVp + 80) - the
-      // floating tab bar pill still overlaps this view (barOverlap applies
-      // to the whole Tabs, not per-tab), so without it long text/an image
-      // can render underneath the pill instead of stopping clear of it.
-      .padding({ left: 20, right: 20, top: this.topInsetVp + 76, bottom: this.bottomInsetVp + 80 })
+      // Room at the top for the floating back button (now in the
+      // NavDestination's title bar) - topInsetVp restored since
+      // syncedTab's Navigation is no longer shifted as a whole (see
+      // syncedTab's comment); the button itself now positions via its own
+      // topInsetVp-based margin (see glassTitleBar), so this content
+      // needs the same clearance to visually start below it. Same bottom
+      // safe-area reservation every other tab uses (this.bottomInsetVp +
+      // 80) - the floating tab bar pill still overlaps this view
+      // (barOverlap applies to the whole Tabs, not per-tab), so without it
+      // long text/an image can render underneath the pill instead of
+      // stopping clear of it.
+      .padding({ left: 20, right: 20, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
       .justifyContent(FlexAlign.Center)
-
-      // Consistent top-left back button, immersive-material like every
-      // other back control in the app (see subScreenHeader) - not a
-      // bottom-centered "Close" that could end up under the nav pill.
-      Button() {
-        Text('‹').fontSize(22).fontColor(Color.White)
-      }
-      .type(ButtonType.Circle)
-      .width(44)
-      .height(44)
-      // Chain ORDER matters, confirmed against the Button reference doc's
-      // own 示例9: .systemMaterial() called BEFORE .backgroundColor() lets
-      // backgroundColor layer on top as a translucent tint; called after
-      // (the earlier version), it gets force-cleared to transparent by the
-      // material call - which is why the button vanished entirely. The
-      // color also has to be genuinely translucent (some non-zero,
-      // non-opaque alpha) or there's nothing for the blur to visually
-      // differ from.
-      .systemMaterial(this.buttonMaterial())
-      .backgroundColor('#66ffffff')
-      .margin({ left: 16, top: this.topInsetVp + 16 })
-      .onClick(() => { this.closeItemDetail(); })
     }
     .width('100%')
     .height('100%')
@@ -1598,181 +2213,678 @@ struct Index {
     // per every official example - wrapping real foreground content
     // (Image/Text/Scroll) in it directly isn't the documented pattern and
     // was actually washing the content out. A flat dark surface is the
-    // correct backdrop for a full-bleed content viewer; the button above
-    // still gets the immersive treatment.
-    .backgroundColor('#000000')
-    .geometryTransition(this.selectedItemId, { follow: true })
+    // correct backdrop for a full-bleed content viewer - and per Huawei's
+    // "如何实现沉浸式页面" FAQ, THIS is the component whose background
+    // should actually extend behind the status bar (the black backdrop
+    // bleeds all the way up, matching a real full-bleed image viewer).
+    // Follows the theme instead of a hardcoded black. A fixed black
+    // backdrop meant that in light mode the page animated white -> grey ->
+    // black as it opened, and the frosted title bar's colorInvert had to
+    // swing its label from dark to light mid-transition, which read as the
+    // nav text "failing to invert". With a themed surface the detail view
+    // starts the same colour family as the page behind it, so the material
+    // and its labels stay put.
+    .backgroundColor($r('sys.color.background_primary'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    // Content component gets geometryTransition, per Huawei's Navigation
+    // FAQ ("给内容组件设置geometryTransition属性，不要设置到NavDestination上") -
+    // NOT the NavDestination wrapping it in syncedPageMap. id must match
+    // syncedItemCard's exactly (item.id) for the morph to connect the two.
+    .geometryTransition(item.id, { follow: true })
     .transition(TransitionEffect.OPACITY)
   }
 
-  // Big page title at the top of a tab's content - the bottom tab bar
-  // labels the destination, this labels where you currently are, which is
-  // its own separate thing most apps show.
-  @Builder
-  pageTitle(text: string) {
-    Text(text)
-      .fontSize(28)
-      .fontWeight(FontWeight.Bold)
-      .width('100%')
+
+  // Height of a floating title bar's content row, BELOW the status bar -
+  // the bar's own box is this plus topInsetVp, so the frosted material
+  // reaches the very top of the screen rather than leaving a bare strip
+  // above it.
+  private readonly TITLE_BAR_HEIGHT: number = 52;
+  // What a scrollable has to reserve at the bottom so its last item can
+  // settle clear of the floating tab pill (content still scrolls THROUGH
+  // this region - it's clearance for the resting position, not a wall).
+  private readonly TAB_PILL_CLEARANCE: number = 84;
+  // The Synced tab additionally has the paste dock sitting above the pill,
+  // so its scrollables need to reserve that too or the last card comes to
+  // rest underneath the paste button.
+  private readonly SYNCED_BOTTOM_CLEARANCE: number = 152;
+
+  // Material for a floating navigation bar. Distinct from buttonMaterial:
+  // no interactive/lightEffect (a whole bar shouldn't deform or chase the
+  // finger), but applyShadow so it separates from content scrolling under
+  // it, and colorInvert so its own labels re-tint against whatever passes
+  // beneath.
+  private barMaterial(): uiMaterial.ImmersiveMaterial {
+    return new uiMaterial.ImmersiveMaterial({
+      style: uiMaterial.ImmersiveStyle.THIN,
+      applyShadow: true,
+      colorInvert: true,
+    });
   }
 
-  // Small pill toggle - highlighted when it's the active mode, transparent
-  // otherwise. Two of these side by side (List / Grid) is the whole control.
+  // The app's one navigation bar, used by every screen.
+  //
+  // It lives in a NavDestination's .title() slot, which matters for two
+  // independent reasons: that slot (plus a BarPosition.End Tabs bar) is
+  // the ONLY place systemMaterial actually renders, and pairing it with
+  // BarStyle.STACK is what makes the destination hand its full box to the
+  // content so the content scrolls UNDERNEATH the bar instead of starting
+  // below it. The bar's height deliberately includes topInsetVp so the
+  // frosted material covers the status bar too - content passing behind
+  // the clock/battery is the whole point of the immersive treatment.
+  //
+  // `back` and `trailing` are plain string discriminators rather than
+  // callbacks/slot builders: ArkTS's UI syntax only accepts direct calls
+  // to real @Builder methods inside a builder body, so a closure
+  // parameter invoked as content() is a compile error.
   @Builder
-  viewModeToggleButton(label: string, mode: string) {
-    Text(label)
-      .fontSize(12)
-      .fontWeight(FontWeight.Medium)
-      .fontColor(this.syncedViewMode === mode ? Color.White : $r('sys.color.brand'))
-      .backgroundColor(this.syncedViewMode === mode ? $r('sys.color.brand') : Color.Transparent)
-      .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-      .borderRadius(12)
-      .onClick(() => { this.syncedViewMode = mode; })
+  glassTitleBar(title: string, back: string, trailing: string) {
+    Row({ space: 6 }) {
+      if (back !== 'none') {
+        Button() {
+          Image($r('app.media.ic_chevron_back'))
+            .width(24)
+            .height(24)
+        }
+        .type(ButtonType.Circle)
+        .width(40)
+        .height(40)
+        // Material renders against the layout bounding box, which stays
+        // square even when ButtonType.Circle clips the visuals - the
+        // immersive-light FAQ's fix for that mismatch is exactly an
+        // explicit clipShape matching the visible shape.
+        .clipShape(new CircleShape({ width: 40, height: 40 }))
+        // Explicitly transparent: a plain Button carries its own opaque
+        // default fill even if backgroundColor is never called, and any
+        // opaque background sits on top of the material and hides it.
+        .backgroundColor(Color.Transparent)
+        .systemMaterial(this.buttonMaterial())
+        // Brief delay so the press/haptic lands visibly before the pop
+        // animation starts cutting the screen away.
+        .onClick(() => {
+          tapHaptic();
+          setTimeout(() => {
+            if (back === 'me') {
+              this.setMeScreen('main');
+            } else {
+              this.closeItemDetail();
+            }
+          }, 50);
+        })
+      }
+
+      Text(title)
+        .fontSize(back === 'none' ? 26 : 20)
+        .fontWeight(FontWeight.Bold)
+        .fontColor($r('sys.color.font_primary'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+
+      if (trailing === 'viewmode') {
+        // The real system segmented control, not a pair of hand-styled
+        // Texts pretending to be one. Beyond matching the platform's own
+        // sliding-thumb behaviour and accessibility, SegmentButton is on
+        // the list of components that pick up immersive material on their
+        // own when the app-level switch is "enable" (module.json5's
+        // ohos.arkui.UIMaterial.state) - so it is materialised by the
+        // framework rather than by a systemMaterial call here.
+        SegmentButton({
+          options: this.viewModeOptions,
+          selectedIndexes: $viewModeSelection,
+          onItemClicked: (index: number) => {
+            tapHaptic();
+            this.syncedViewMode = index === 0 ? 'list' : 'waterfall';
+          },
+        })
+          .width(148)
+      }
+    }
+    .width('100%')
+    .height(this.topInsetVp + this.TITLE_BAR_HEIGHT)
+    .padding({ left: back === 'none' ? 20 : 10, right: 14, top: this.topInsetVp })
+    .alignItems(VerticalAlign.Center)
+    .systemMaterial(this.barMaterial())
   }
 
+  // Wraps the list and the item-detail view as two NavDestinations on their
+  // own stack, rather than the plain if/else-driven @State toggle this used
+  // to be. Two reasons this had to change, both confirmed against Huawei's
+  // own docs while investigating why the detail view's back button never
+  // showed immersive material:
+  // 1. Consistency: every screen's chrome now comes from one shared
+  //    glassTitleBar in the destination's title slot, instead of each
+  //    screen positioning its own floating button with its own offsets.
+  //    (An earlier revision justified this by claiming systemMaterial
+  //    can ONLY render in a title bar or Tabs bar - that claim was
+  //    wrong; see itemDetailView's note.)
+  // 2. geometryTransition (the "一镜到底" shared-element morph the list card
+  //    and detail view already relied on) is ONLY supported between two
+  //    NavDestinations - a transition between Navigation's NavBar and a
+  //    NavDestination is explicitly NOT supported by the system
+  //    (arkts-navigation-faq). Since the back button has to live in a real
+  //    NavDestination for immersive material to work, the list side of the
+  //    animation has to be a NavDestination too, not plain NavBar content,
+  //    or the shared-element morph would just stop working.
   @Builder
   syncedTab() {
-    // Mutually exclusive with the detail view (an if/else, not an overlay
-    // Stack) - geometryTransition expects the shared-id element to exist
-    // in only ONE of the two branches at a time. The earlier Stack-overlay
-    // version kept the card AND the detail view mounted simultaneously
-    // with the same id, which is what produced the blank black screen
-    // instead of an actual morph.
-    if (this.selectedItemId.length === 0) {
-      Column({ space: 8 }) {
-        Row() {
-          // pageTitle's own Text is hard-coded to width('100%') (it's meant
-          // to be the sole content of its row everywhere else it's used) -
-          // sitting next to the toggle in the same Row, that claimed the
-          // ENTIRE row's width for itself and pushed the toggle off past the
-          // right edge instead of just sizing to its own text. Wrapping it
-          // in a layoutWeight(1) container caps it to its fair share (parent
-          // width minus the toggle's own size) instead of the full width,
-          // which is what actually leaves room for the toggle to render
-          // on-screen. Blank() alone doesn't fix this - it competes for
-          // remaining space same as any flexible child, but pageTitle's
-          // Text isn't flexible, it's hard-set to 100%, so Blank() would
-          // still be racing against a fixed-at-100% sibling and lose.
-          Row() { this.pageTitle('Synced') }.layoutWeight(1)
-          Row({ space: 6 }) {
-            this.viewModeToggleButton('List', 'list')
-            this.viewModeToggleButton('Grid', 'waterfall')
-          }
-        }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: this.topInsetVp + 16 })
+    Navigation(this.syncedNavStack) {
+      // Intentionally empty - hideNavBar means this NavBar content is
+      // never actually shown. 'syncedList' (pushed in aboutToAppear) is
+      // the real home screen; see syncedPageMap below.
+    }
+    .hideNavBar(true)
+    .navDestination(this.syncedPageMap)
+    .width('100%')
+    .height('100%')
+    // Not shifted down by topInsetVp (an earlier fix here was reverted) -
+    // per Huawei's own "如何实现沉浸式页面" FAQ, the correct pattern for a
+    // fullscreen window (EntryAbility.ets's setWindowLayoutFullScreen) is
+    // NOT to shift a whole container away from the status bar - it's to
+    // let it draw there, and apply expandSafeArea selectively to whichever
+    // specific component's background/content should bleed through, while
+    // readable elements (titles, buttons) use their own topInsetVp-based
+    // padding/margin to stay clear. Shifting the whole Navigation fixed
+    // clipping but also blocked every child from ever reaching the status
+    // bar at all, including the scrollable content that's supposed to
+    // extend behind it - see syncedListContent/glassTitleBar for the
+    // per-component split this replaced it with.
+  }
 
-        Column({ space: 8 }) {
-          Text(this.pendingChange ? 'Clipboard changed — tap to sync' : 'Clipboard up to date').fontSize(15).fontWeight(FontWeight.Medium)
-          PasteButton({ icon: PasteIconStyle.LINES, text: PasteDescription.PASTE, buttonType: ButtonType.Capsule })
-            .onClick((event: ClickEvent, result: PasteButtonOnClickResult) => { void this.onPasteButtonClick(result); })
-        }
-        .width('100%')
-        .padding(16)
-        .borderRadius(18)
-        .systemMaterial(this.materialCard())
-        .alignItems(HorizontalAlign.Start)
-        .margin({ left: 16, right: 16 })
 
-        if (this.syncedItems.length === 0) {
-          Text('Nothing synced yet.').fontSize(12).fontColor('#999999').padding({ left: 16, right: 16 })
-        } else if (this.syncedViewMode === 'list') {
-          List({ space: 10 }) {
-            ForEach(this.syncedItems, (item: SyncedItem) => {
-              ListItem() { this.syncedItemCard(item) }
-            }, (item: SyncedItem) => item.id)
-          }
-          .width('100%')
-          .padding({ left: 16, right: 16, bottom: this.bottomInsetVp + 80 })
-          .edgeEffect(EdgeEffect.Spring)
-          .layoutWeight(1)
-        } else {
-          // Same WaterFlow pattern devicesTab uses below - a 2-column grid
-          // rather than a single stacked list, per request.
-          WaterFlow() {
-            ForEach(this.syncedItems, (item: SyncedItem) => {
-              FlowItem() { this.syncedGridCard(item) }
-            }, (item: SyncedItem) => item.id)
-          }
-          .columnsTemplate('1fr 1fr')
-          .columnsGap(10)
-          .rowsGap(10)
-          .padding({ left: 16, right: 16, bottom: this.bottomInsetVp + 80 })
-          .layoutWeight(1)
+  @Builder
+  syncedPageMap(name: string) {
+    if (name === 'syncedList') {
+      NavDestination() {
+        this.syncedListContent()
+      }
+      // A real frosted title bar now, not the zero-size placeholder this
+      // used to pass: the page title and List/Grid toggle moved up here
+      // from the content, so they get immersive material (only ever
+      // rendered in this slot or a bottom Tabs bar) and the list scrolls
+      // underneath them rather than starting below them.
+      .title(this.glassTitleBar('Synced', 'none', 'viewmode'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      // Checked the SDK's own common.d.ts/nav_destination.d.ts directly
+      // (the doc site wasn't loading) - expandSafeArea (used below, on
+      // syncedListContent's Stack) only extends where content is allowed
+      // to DRAW; it never changes what a component is LAID OUT/measured
+      // against. ignoreLayoutSafeArea is the one that actually grows the
+      // LAYOUT box - the declaration's own comment names List/Grid/
+      // WaterFlow/Swiper/Tabs by name as the scrollable components this
+      // matters for, which is exactly the symptom here (grid content
+      // overlapping/spilling because its container's real layout size
+      // was smaller than what was visible). Prerequisite (title hidden or
+      // BarStyle.STACK) is already satisfied by the .title() call above.
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    } else if (name === 'itemDetail') {
+      NavDestination() {
+        if (this.syncedItems.find(i => i.id === this.selectedItemId)) {
+          this.itemDetailView(this.syncedItems.find(i => i.id === this.selectedItemId) as SyncedItem)
         }
       }
-      .width('100%')
-      .height('100%')
-      .align(Alignment.Top)
-    } else if (this.syncedItems.find(i => i.id === this.selectedItemId)) {
-      this.itemDetailView(this.syncedItems.find(i => i.id === this.selectedItemId) as SyncedItem)
+      // Same shared bar as every other screen, with a back affordance -
+      // the detail view's back button used to be its own separately
+      // positioned floating circle with its own hand-tuned topInsetVp
+      // margin, which is why it kept landing in a different place from
+      // the Me sub-screens' equally hand-tuned one. Both are now the same
+      // component in the same slot.
+      .title(this.glassTitleBar('', 'detail', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      // System back gesture AND a tap on the native back button both
+      // funnel through this same interception point - needed so either
+      // one goes through the same animateTo-wrapped pop as closeItemDetail
+      // uses, not a plain default pop that would skip the
+      // geometryTransition morph entirely.
+      .onBackPressed(() => { this.closeItemDetail(); return true; })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     }
+  }
+
+  // Approximate height of the floating title-row + paste-button card
+  // (measured by eye, not queried from the framework - a Stack overlay
+  // has no built-in way to ask its sibling for its rendered size). Used
+  // as top clearance for the list/grid below so the first item starts
+  // visibly below the card on load; scrolling still passes items behind
+  // it afterward since it's a Stack overlay, not normal Column flow. This
+  // is on top of topInsetVp (added at each use site below) since the
+  // header row now starts after the status bar, not at y=0.
+  // Top clearance for the Synced scrollables: enough that the first card
+  // rests below the floating title bar while still scrolling up behind it.
+  private syncedTopClearance(): number {
+    return this.topInsetVp + this.TITLE_BAR_HEIGHT + 8;
+  }
+
+  // The paste action, docked directly above the floating tab pill so it
+  // reads as part of the bottom navigation cluster rather than as content.
+  //
+  // Always present, not conditional on pendingChange: HarmonyOS will not
+  // let an app read the clipboard silently, so this button is the ONLY way
+  // to push what's on this device - hiding it whenever the app hadn't
+  // already noticed a change meant the one manual escape hatch vanished
+  // exactly when someone would reach for it. pendingChange now only
+  // controls emphasis.
+  //
+  // PasteButton is a system security component: its label and icon come
+  // from a fixed system enum and are localized by the system (hence 粘贴
+  // on a Chinese-locale device), so the surrounding capsule - not the
+  // button - is what carries the immersive material.
+  // Sits INSIDE the Synced content Stack as an ordinary bottom-aligned
+  // child - deliberately NOT a full-screen overlay mounted beside Tabs.
+  // As an overlay the security component's click was rejected outright:
+  // onClick never fired at all (verified with logging), regardless of
+  // hitTestBehavior or whether the frosted wrapper was present. Ordinary
+  // content flow is the arrangement PasteButton accepts.
+  //
+  // Always present, not conditional on pendingChange: HarmonyOS will not
+  // let an app read the clipboard silently, so this button is the ONLY way
+  // to push what's on this device - hiding it whenever the app hadn't
+  // already noticed a change removed the one manual escape hatch exactly
+  // when someone would reach for it.
+  @Builder
+  pasteDock() {
+    Row() {
+      PasteButton({ icon: PasteIconStyle.LINES, text: PasteDescription.PASTE, buttonType: ButtonType.Capsule })
+        .onClick((event: ClickEvent, result: PasteButtonOnClickResult) => { tapHaptic(); void this.onPasteButtonClick(result); })
+    }
+    .padding(14)
+    .borderRadius(34)
+    .alignItems(VerticalAlign.Center)
+    .systemMaterial(new uiMaterial.ImmersiveMaterial({
+      style: uiMaterial.ImmersiveStyle.REGULAR,
+      applyShadow: true,
+      colorInvert: true,
+      materialColor: $r('sys.color.comp_background_primary'),
+    }))
+    .margin({ bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE + 10 })
+  }
+
+  // Empty states - a headline plus one line of explanation, centered,
+  // rather than a stray line of small gray text against a blank screen.
+  @Builder
+  emptyState(headline: string, detail: string, art: Resource) {
+    Column({ space: 8 }) {
+      Image(art)
+        .width(120)
+        .height(120)
+        .margin({ bottom: 8 })
+      Text(headline)
+        .fontSize(17)
+        .fontWeight(FontWeight.Medium)
+        .fontColor($r('sys.color.font_primary'))
+        .textAlign(TextAlign.Center)
+      Text(detail)
+        .fontSize(13)
+        .fontColor($r('sys.color.font_secondary'))
+        .textAlign(TextAlign.Center)
+    }
+    // Fills its container and centers, rather than sizing to its own text:
+    // as a bare-height child of a TopStart-aligned Stack it was landing at
+    // the very top of the screen, tucked up behind the floating title bar.
+    .width('100%')
+    .height('100%')
+    .padding({ left: 40, right: 40, top: this.topInsetVp, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
+    .alignItems(HorizontalAlign.Center)
+    .justifyContent(FlexAlign.Center)
+  }
+
+  // Stack, not Column: the title row + paste-button card float as an
+  // overlay ON TOP of the list/grid (last child = top z-order in a Stack)
+  // rather than being laid out above it in the document flow - that's
+  // what lets scrolled content pass visibly behind them, the same way the
+  // floating tab-bar pill already does via Tabs' barOverlap.
+  @Builder
+  syncedListContent() {
+    Stack({ alignContent: Alignment.Bottom }) {
+      if (this.syncedItems.length === 0) {
+        this.emptyState('Nothing synced yet', 'Copy something on this or another trusted device and it will appear here.', $r('app.media.ic_empty_synced'))
+      } else if (this.syncedViewMode === 'list') {
+        List({ space: 10 }) {
+          ForEach(this.syncedItems, (item: SyncedItem) => {
+            ListItem() { this.syncedItemCard(item) }
+          }, (item: SyncedItem) => item.id)
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ left: 16, right: 16 })
+        // contentStartOffset/contentEndOffset, NOT top/bottom padding.
+        // A List paints its own background across its full border box but
+        // CLIPS its items to the padding box, so padding-based clearance
+        // meant items were cut off at a hard edge exactly where the
+        // floating bar began instead of sliding underneath it. (Verified
+        // on-device: with the list temporarily tinted, the tint reached
+        // y=0 behind both bars while the cards still stopped at the bar's
+        // edge - so the box was already full-screen and padding was the
+        // thing clipping.) These two attributes set the resting offset of
+        // the content without clipping, which is exactly the
+        // content-under-floating-chrome case they exist for.
+        .contentStartOffset(this.syncedTopClearance())
+        .contentEndOffset(this.bottomInsetVp + this.SYNCED_BOTTOM_CLEARANCE)
+        .edgeEffect(EdgeEffect.Spring)
+        // Per Huawei's "如何实现沉浸式页面" FAQ: this is the component whose
+        // own background/content should actually draw behind the status
+        // bar (unlike the title row below, which stays clear via
+        // topInsetVp padding instead) - lets list cards scroll up and
+        // remain visible through/behind the status bar area as you scroll,
+        // matching how other apps handle this rather than leaving a gap.
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+      } else {
+        // Same WaterFlow pattern devicesTab uses below - a 2-column grid
+        // rather than a single stacked list, per request.
+        WaterFlow() {
+          ForEach(this.syncedItems, (item: SyncedItem) => {
+            // .width('100%') directly on FlowItem, not just on
+            // syncedGridCard's own inner Column two levels down - per the
+            // official FlowItem reference, FlowItem itself has no
+            // component-specific attributes, so its cross-axis box comes
+            // entirely from whatever universal attributes are set on it;
+            // leaving it unset was what let a FlowItem's actual box drift
+            // wider than its column after a reflow (see itemConstraintSize
+            // below).
+            FlowItem() { this.syncedGridCard(item) }.width('100%')
+          }, (item: SyncedItem) => item.id)
+        }
+        .width('100%')
+        .height('100%')
+        .columnsTemplate('1fr 1fr')
+        .columnsGap(10)
+        .rowsGap(10)
+        // Per the official WaterFlow reference: "When the main axis size
+        // of a FlowItem changes after it is displayed, WaterFlow clears
+        // the affected layout information and recalculates..." - an
+        // async-decoding base64 Image (see syncedGridCard) is exactly
+        // this case, and the resulting reflow was what let a card's box
+        // visually bridge into its neighboring column (confirmed via
+        // pixel measurement on-device: the columnsGap band between two
+        // cards fully vanished exactly where a larger image card sat).
+        // itemConstraintSize applies a hard constraintSize to every
+        // FlowItem directly (not a nested grandchild), so no single
+        // item's post-reflow box can ever exceed this regardless of what
+        // its content does.
+        .itemConstraintSize({ maxHeight: 320 })
+        .padding({ left: 16, right: 16 })
+        // Same contentStartOffset/contentEndOffset treatment as the List
+        // branch. An earlier revision claimed these were "List-only" after
+        // grepping water_flow.d.ts and finding nothing - that was wrong:
+        // WaterFlowAttribute extends ScrollableCommonMethod (water_flow.d.ts:489)
+        // and it is ScrollableCommonMethod that declares them
+        // (common.d.ts:25367/25382), so WaterFlow inherits both.
+        //
+        // The workaround that claim produced - vertical padding plus
+        // clip(false) - caused cards to flash out of existence at the
+        // chrome. A scrollable's viewport IS its content rect (border box
+        // minus padding), and items are only PAINTED while they intersect
+        // that rect; clip(false) merely removes the clipping rectangle, it
+        // does not widen the draw range, so items stopped being drawn
+        // exactly at the inner edge of the frosted bar. Dropping the
+        // vertical padding makes the content rect equal the border box
+        // (the full screen), so items keep painting all the way under the
+        // bars, and these two offsets supply the resting clearance instead.
+        .contentStartOffset(this.syncedTopClearance())
+        .contentEndOffset(this.bottomInsetVp + this.SYNCED_BOTTOM_CLEARANCE)
+        // WaterFlow doesn't default to Spring the way List does - without
+        // this the grid view felt visually inconsistent with the list
+        // view's bounce feedback at the scroll ends.
+        .edgeEffect(EdgeEffect.Spring)
+        // See the List branch's identical comment above.
+        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+      }
+
+      // The page title and List/Grid control live in the frosted title bar
+      // (glassTitleBar); only the paste action is pinned here, bottom
+      // aligned above the tab pill. It must stay in this content Stack
+      // rather than being an overlay beside Tabs - see pasteDock.
+      this.pasteDock()
+    }
+    // LayoutPolicy.matchParent, not '100%' - per common.d.ts's own note on
+    // ignoreLayoutSafeArea: "if its width or height is set to
+    // LayoutPolicy.matchParent, both its size AND position will change;
+    // otherwise, only its position will change." A percentage width/
+    // height wouldn't actually grow when the parent's own safe-area
+    // layout box grows - matchParent is what lets this Stack's true size
+    // expand into the safe area rather than just being repositioned
+    // within its old (too-small) size.
+    .width(LayoutPolicy.matchParent)
+    .height(LayoutPolicy.matchParent)
+    // On the Stack itself, not a nested grandchild - this is the
+    // NavDestination's actual direct child, so it's the box that
+    // determines how much room the List/WaterFlow and the floating header
+    // both have to work with. Mirrors itemDetailView's identical call on
+    // its own top-level Stack, the one other NavDestination on this stack
+    // confirmed to reach the true screen edges - applying it one level
+    // deeper (as it was, only on the List/WaterFlow) left this Stack
+    // itself bounded above the true edges, so nothing inside it could
+    // ever visually reach past that boundary no matter what padding or
+    // z-order the children used.
+    //
+    // ignoreLayoutSafeArea added alongside expandSafeArea - per the SDK's
+    // own doc comment, "ignoreLayoutSafeArea takes effect first, and
+    // expandSafeArea takes effect on the basis of the former": the first
+    // actually grows this Stack's LAYOUT box (what WaterFlow/List measure
+    // their own size against), the second controls what's allowed to
+    // DRAW past that box's original edges. Both were needed - expandSafeArea
+    // alone left the true layout size unchanged, which is what was letting
+    // WaterFlow's masonry math work against a too-small box while content
+    // visually painted past it, reading as cards overlapping/spilling off
+    // screen.
+    // Explicit page background so cards read as cards. comp_background_list_card
+    // (what every card uses) is near-white in light mode, and with the page
+    // itself defaulting to white too, the cards were white-on-white with no
+    // edge at all. background_secondary is the grouped-list backdrop the
+    // system pairs with that card token, and both re-resolve per theme, so
+    // the pairing holds in dark mode instead of inverting into another
+    // same-on-same collision. It is also what the frosted bars sample.
+    .backgroundColor($r('sys.color.background_secondary'))
+    .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   @Builder
   deviceCard(row: DeviceRow) {
-    Column({ space: 6 }) {
-      Row()
-        .width(28)
-        .height(28)
-        .borderRadius(9)
-        .backgroundColor(row.connected ? $r('sys.color.brand') : '#c7c7c2')
-      Text(row.address ?? 'unknown IP').fontSize(13).fontWeight(FontWeight.Medium)
-      Text(row.connected ? 'Connected' : row.trusted ? 'Trusted' : 'Discovered')
-        .fontSize(10).fontColor(row.connected ? '#16A34A' : '#8A8A86')
+    Row({ space: 12 }) {
+      // Device glyph with the status dot badged onto it, rather than a
+      // bare dot - tells you WHAT the device is, not just that it exists.
+      Stack({ alignContent: Alignment.BottomEnd }) {
+        Image($r('app.media.ic_device_desktop'))
+          .width(26)
+          .height(26)
+        Row()
+          .width(10)
+          .height(10)
+          .borderRadius(5)
+          .backgroundColor(row.connected ? $r('sys.color.confirm') : $r('sys.color.icon_secondary'))
+      }
+      .width(28)
+      .height(28)
+
+      Column({ space: 2 }) {
+        if (row.addresses.length === 0) {
+          Text('Unknown address')
+            .fontSize(15)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('sys.color.font_primary'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+        } else {
+          // One line per address - a peer can legitimately be reachable at
+          // both a LAN IP and a Tailscale IP, and which one it is paired on
+          // matters when diagnosing a connection.
+          ForEach(row.addresses, (addr: string) => {
+            Text(addr)
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('sys.color.font_primary'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }, (addr: string) => addr)
+        }
+        Text(row.connected ? 'Connected' : row.trusted ? 'Trusted · not connected' : 'Discovered nearby')
+          .fontSize(12)
+          .fontColor(row.connected ? $r('sys.color.confirm') : $r('sys.color.font_secondary'))
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
 
       if (!row.trusted && row.discovered) {
-        Button('Trust').fontSize(12).fontColor($r('sys.color.brand')).systemMaterial(this.buttonMaterial()).backgroundColor('#330A59F7').width('100%').onClick(() => {
-          const beacon = this.receivedBeacons.find(b => b.deviceId === row.deviceId);
-          if (beacon) void this.trustAndConnect(beacon);
-        })
+        // Deliberately a plain solid button, no systemMaterial: material
+        // WOULD render here (it is a CommonMethod attribute, available on
+        // every component - see itemDetailView's note correcting the
+        // earlier claim otherwise), but a frosted primary action competes
+        // with the frosted nav chrome for attention. Chrome is frosted,
+        // actions are solid. Note also that where material does take
+        // effect on a mid/high-tier device it RESETS backgroundColor to
+        // transparent, so the two can't simply be combined - materialColor
+        // is the documented way to tint a material.
+        // Sized to its label and sitting beside the device, not stretched
+        // to the full card width underneath it - a full-width button read
+        // as the card's primary action when it's a secondary one.
+        Button('Trust')
+          .fontSize(13)
+          .fontColor($r('sys.color.font_on_primary'))
+          .backgroundColor($r('sys.color.brand'))
+          .height(34)
+          .padding({ left: 16, right: 16 })
+          .onClick(() => {
+            tapHaptic();
+            const beacon = this.receivedBeacons.find(b => b.deviceId === row.deviceId);
+            if (beacon) void this.trustAndConnect(beacon);
+          })
       } else if (row.trusted) {
-        Button('Remove').fontSize(12).fontColor($r('sys.color.brand')).systemMaterial(this.buttonMaterial()).backgroundColor('#330A59F7').width('100%').onClick(() => { void this.untrustDevice(row.deviceId); })
+        // Destructive, so it stays quiet: a tinted secondary surface
+        // rather than a filled brand button competing with Trust.
+        Button('Remove')
+          .fontSize(13)
+          .fontColor($r('sys.color.font_secondary'))
+          .backgroundColor($r('sys.color.comp_background_tertiary'))
+          .height(34)
+          .padding({ left: 16, right: 16 })
+          .onClick(() => { tapHaptic(); void this.untrustDevice(row.deviceId); })
       }
     }
     .width('100%')
-    .padding(12)
+    .padding({ left: 14, right: 14, top: 14, bottom: 14 })
     .borderRadius(18)
-    // Connected devices get a distinct accent-tinted background rather
-    // than blending into the same plain white every other card uses.
-    .backgroundColor(row.connected ? '#EAF2FF' : '#FFFFFF')
-    .alignItems(HorizontalAlign.Start)
+    // One neutral card surface for every state - the connected case is
+    // already carried by the dot and the status line, so tinting the
+    // whole card for it as well just made the list noisier. Both tokens
+    // re-resolve per theme, which the old hardcoded '#FFFFFF'/'#EAF2FF'
+    // pair did not: the device name follows the theme to near-white in
+    // dark mode, and against a card frozen at white that was invisible.
+    .backgroundColor($r('sys.color.comp_background_list_card'))
+    .alignItems(VerticalAlign.Center)
     .clickEffect({ level: ClickEffectLevel.MIDDLE })
   }
 
   @Builder
-  devicesTab() {
-    Column({ space: 8 }) {
-      Column() { this.pageTitle('Devices') }
-        .width('100%')
-        .padding({ left: 16, right: 16, top: this.topInsetVp + 16 })
-      Text(`${this.connectedCount} device(s) connected`).fontSize(14).fontColor('#666666')
-        .width('100%')
-        .padding({ left: 16, right: 16 })
-
-      if (this.deviceRows().length === 0) {
-        Text('No devices yet. Trusted devices and nearby devices on the same network will show up here.')
-          .fontSize(12).fontColor('#999999')
-          .padding({ left: 16, right: 16 })
-      } else {
-        // WaterFlow, per request - a 2-column masonry grid rather than a
-        // single stacked list, since device cards have different heights
-        // (a discovered-only card gains a Trust button the others don't).
-        WaterFlow() {
-          ForEach(this.deviceRows(), (row: DeviceRow) => {
-            FlowItem() { this.deviceCard(row) }
-          }, (row: DeviceRow) => row.deviceId)
-        }
-        .columnsTemplate('1fr 1fr')
-        .columnsGap(10)
-        .rowsGap(10)
-        .padding({ left: 16, right: 16, bottom: this.bottomInsetVp + 80 })
-        .layoutWeight(1)
+  devicesContent() {
+    List({ space: 10 }) {
+      ListItem() {
+        // Summary line reads as a status, not a stat: the count is the
+        // part worth emphasizing, the rest is context.
+        Text(this.connectedCount === 0
+          ? 'No devices connected'
+          : `${this.connectedCount} device${this.connectedCount === 1 ? '' : 's'} connected`)
+          .fontSize(13)
+          .fontColor(this.connectedCount > 0 ? $r('sys.color.confirm') : $r('sys.color.font_secondary'))
+          .fontWeight(FontWeight.Medium)
+          .width('100%')
+          .padding({ left: 4, bottom: 2 })
       }
+      if (this.deviceRows().length === 0) {
+        ListItem() {
+          // Not this.emptyState here - that one fills and centers its
+          // container, which inside a ListItem would mean centering
+          // within a single row. Plain copy is right for a list that
+          // still has its summary line above it.
+          Text('Trusted devices, and nearby devices on the same network, will show up here.')
+            .fontSize(13)
+            .fontColor($r('sys.color.font_secondary'))
+            .width('100%')
+            .padding({ left: 4, top: 8 })
+        }
+      } else {
+        ForEach(this.deviceRows(), (row: DeviceRow) => {
+          ListItem() { this.deviceCard(row) }
+          // Key includes connected/trusted/discovered, not just deviceId -
+          // ArkUI's ForEach reuses a child node whenever its key is
+          // unchanged, so a deviceId-only key meant a connect/disconnect
+          // never actually re-invoked deviceCard(row) with the new
+          // status, leaving the card frozen at whatever it was first
+          // rendered with (while the live connectedCount text above kept
+          // updating) - same failure mode already documented on
+          // SyncedItem.id above.
+        }, (row: DeviceRow) => `${row.deviceId}:${row.connected}:${row.trusted}:${row.discovered}:${row.addresses.join(',')}`)
+      }
+    }
+    // Single column, not the old 2-column WaterFlow: this list is
+    // realistically 1-3 devices, and a masonry grid made each one a
+    // cramped half-width tile for no benefit. A full-width row also has
+    // space to put the action button beside the device instead of
+    // stacked under it.
+    .width(LayoutPolicy.matchParent)
+    .height(LayoutPolicy.matchParent)
+    .padding({ left: 16, right: 16 })
+    // See the Synced list's note - offsets, not padding, so device cards
+    // slide under the floating bars instead of being clipped at them.
+    .contentStartOffset(this.topInsetVp + this.TITLE_BAR_HEIGHT + 8)
+    .contentEndOffset(this.bottomInsetVp + this.TAB_PILL_CLEARANCE)
+    .edgeEffect(EdgeEffect.Spring)
+    // See syncedListContent's note - page backdrop the card token pairs with.
+    .backgroundColor($r('sys.color.background_secondary'))
+    .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+  }
+
+  // Bottom-right "+" on the Devices tab: the primary thing you come to
+  // this tab to do is add a device, and that was previously buried three
+  // taps deep under Me > Pairing. Mirrors pasteDock's structure - a
+  // full-screen, hit-test-transparent overlay that parks one control in a
+  // corner - so it sits above the floating tab pill without absolute
+  // positioning.
+  @Builder
+  addDeviceFab() {
+    Column() {
+      Button() {
+        Text('+')
+          .fontSize(28)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_on_primary'))
+      }
+      .type(ButtonType.Circle)
+      .width(56)
+      .height(56)
+      .backgroundColor($r('sys.color.brand'))
+      .onClick(() => { tapHaptic(); setTimeout(() => { this.openPairingFromDevices(); }, 50); })
     }
     .width('100%')
     .height('100%')
-    .alignItems(HorizontalAlign.Start)
+    .justifyContent(FlexAlign.End)
+    .alignItems(HorizontalAlign.End)
+    .padding({ right: 20, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE + 10 })
+    // See pasteDock's note on None vs Transparent.
+    .hitTestBehavior(HitTestMode.None)
+  }
+
+  @Builder
+  devicesPageMap(name: string) {
+    if (name === 'devicesMain') {
+      NavDestination() {
+        this.devicesContent()
+      }
+      .title(this.glassTitleBar('Devices', 'none', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    }
+  }
+
+  @Builder
+  devicesTab() {
+    Navigation(this.devicesNavStack) {
+    }
+    .hideNavBar(true)
+    .navDestination(this.devicesPageMap)
+    .width('100%')
+    .height('100%')
   }
 
   // Small caption label above a settings group, matching the grouped-list
@@ -1782,7 +2894,7 @@ struct Index {
   sectionHeader(text: string) {
     Text(text.toUpperCase())
       .fontSize(11)
-      .fontColor('#8A8A86')
+      .fontColor($r('sys.color.font_secondary'))
       .fontWeight(FontWeight.Medium)
       .padding({ left: 4, bottom: 2 })
   }
@@ -1791,33 +2903,120 @@ struct Index {
   // and a trailing chevron when it navigates, so every row in the list
   // reads as the same kind of control.
   @Builder
-  settingsRow(title: string, value: string, navigates: boolean, onTap: () => void) {
-    Row({ space: 8 }) {
+  settingsRow(title: string, value: string, navigates: boolean, icon: Resource, onTap: () => void) {
+    Row({ space: 12 }) {
+        // No .fillColor() here. Image.fillColor only recolors an SVG's
+        // FILL, not its STROKE - verified on-device by zooming a rendered
+        // icon: the fill-drawn parts tinted correctly while every
+        // stroke-drawn part stayed black regardless of the colour passed.
+        // Since this icon set is stroke-based line art, colour is baked
+        // into the asset instead and light/dark ship as a
+        // resources/base + resources/dark qualifier pair.
+      Image(icon)
+        .width(22)
+        .height(22)
       Text(title).fontSize(14).layoutWeight(1)
       if (value.length > 0) {
-        Text(value).fontSize(13).fontColor('#8A8A86')
+        Text(value).fontSize(13).fontColor($r('sys.color.font_secondary'))
       }
       if (navigates) {
-        Text('›').fontSize(16).fontColor('#8A8A86')
+        Image($r('app.media.ic_chevron_right'))
+          .width(16)
+          .height(16)
       }
     }
     .width('100%')
     .padding({ left: 14, right: 14, top: 13, bottom: 13 })
     .clickEffect({ level: ClickEffectLevel.MIDDLE })
-    .onClick(onTap)
+    .onClick(() => { tapHaptic(); onTap(); })
   }
 
-  // A sub-screen's own back-button header, factored out since every Me
-  // sub-screen (pairing, passcode, diagnostics, log) needs the identical one.
+
+  // Wraps the Me tab's main screen and every sub-screen as NavDestinations
+  // on their own stack - same reasoning as syncedTab/syncedPageMap: a
+  // plain Button in ordinary content (which is what subScreenHeader's back
+  // button used to be) can never show immersive material, only a real
+  // NavDestination title bar can. setMeScreen (above) is what actually
+  // drives push/pop on meNavStack; this only renders whichever route is
+  // currently on top.
   @Builder
-  subScreenHeader(title: string) {
-    Row({ space: 8 }) {
-      Button('‹').fontSize(18).fontColor($r('sys.color.brand')).systemMaterial(this.buttonMaterial()).backgroundColor('#330A59F7')
-        .onClick(() => { this.setMeScreen('main'); })
-      Text(title).fontSize(20).fontWeight(FontWeight.Bold)
+  meTab() {
+    Navigation(this.meNavStack) {
+      // Intentionally empty - hideNavBar means this is never shown;
+      // 'meMain' (pushed in aboutToAppear) is the real home screen.
     }
+    .hideNavBar(true)
+    .navDestination(this.mePageMap)
     .width('100%')
-    .padding({ bottom: 8 })
+    .height('100%')
+    // Not shifted by topInsetVp - see syncedTab's identical comment.
+  }
+
+  // Each branch below is the same shape - a NavDestination with a native
+  // string title (a real title bar, so immersive material actually works,
+  // per the doc-confirmed restriction above), and system back routed
+  // through setMeScreen so it stays in sync with
+  // pairingOpen exactly like the visible back button does. Inlined per
+  // screen rather than factored into one shared helper taking the content
+  // as a callback parameter - ArkTS's declarative UI syntax only
+  // recognizes direct calls to actual @Builder methods inside a @Builder
+  // body, not a plain function-typed parameter invoked as a closure
+  // ('content()' does not meet UI component syntax was the compiler error
+  // that first attempt produced).
+  @Builder
+  mePageMap(name: string) {
+    if (name === 'meMain') {
+      NavDestination() {
+        this.meMainContent()
+      }
+      .title(this.glassTitleBar('Me', 'none', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    } else if (name === 'pairing') {
+      // Shared glassTitleBar, same as every other screen - these five
+      // sub-screens used to each build their own back button with their
+      // own hand-tuned offsets, which is how they drifted out of
+      // alignment with the detail view's.
+      NavDestination() {
+        this.pairingScreenContent()
+      }
+      .title(this.glassTitleBar('Pairing', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      .onBackPressed(() => { this.setMeScreen('main'); return true; })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    } else if (name === 'passcode') {
+      NavDestination() {
+        this.passcodeScreenContent()
+      }
+      .title(this.glassTitleBar('Passcode auto-trust', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      .onBackPressed(() => { this.setMeScreen('main'); return true; })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    } else if (name === 'network') {
+      NavDestination() {
+        this.networkScreenContent()
+      }
+      .title(this.glassTitleBar('Tailscale IP', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      .onBackPressed(() => { this.setMeScreen('main'); return true; })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    } else if (name === 'diagnostics') {
+      NavDestination() {
+        this.diagnosticsScreenContent()
+      }
+      .title(this.glassTitleBar('Diagnostics', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      .onBackPressed(() => { this.setMeScreen('main'); return true; })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    } else if (name === 'log') {
+      NavDestination() {
+        this.activityLogScreenContent()
+      }
+      .title(this.glassTitleBar('Activity log', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .hideBackButton(true)
+      .onBackPressed(() => { this.setMeScreen('main'); return true; })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
+    }
   }
 
   // Primary "Me" screen: identity + a real settings list, one row per
@@ -1825,17 +3024,21 @@ struct Index {
   // navigating to its OWN separate screen - not one page with everything
   // clumped together.
   @Builder
-  meTab() {
-    if (this.meScreen === 'main') {
+  meMainContent() {
       Scroll() {
         Column({ space: 16 }) {
-          this.pageTitle('Me')
-
+          // No in-flow page title here any more - "Me" lives in the
+          // frosted title bar (see mePageMap), which this content scrolls
+          // underneath.
           this.sectionHeader('Device')
           Column() {
             Column({ space: 4 }) {
-              Text('Your device ID').fontSize(12).fontColor('#8A8A86')
-              Text(this.ownDeviceId).fontSize(11).copyOption(CopyOptions.LocalDevice)
+              Text('Your device ID').fontSize(12).fontColor($r('sys.color.font_secondary'))
+              Text(this.ownDeviceId)
+                .fontSize(11)
+                .fontColor($r('sys.color.font_primary'))
+                .copyOption(CopyOptions.LocalDevice)
+                .wordBreak(WordBreak.BREAK_ALL)
             }
             .width('100%')
             .alignItems(HorizontalAlign.Start)
@@ -1847,11 +3050,11 @@ struct Index {
 
           this.sectionHeader('Pairing')
           Column() {
-            this.settingsRow('QR code & scan', '', true, () => { this.setMeScreen('pairing'); })
-            Divider().color('#00000010')
-            this.settingsRow('Passcode auto-trust', this.hasPassphrase ? 'On' : 'Off', true, () => { this.setMeScreen('passcode'); })
-            Divider().color('#00000010')
-            this.settingsRow('Tailscale IP', this.tailscaleIp.length > 0 ? this.tailscaleIp : 'Not set', true, () => { this.setMeScreen('network'); })
+            this.settingsRow('QR code & scan', '', true, $r('app.media.ic_settings_qr'), () => { this.setMeScreen('pairing'); })
+            Divider().color($r('sys.color.comp_divider'))
+            this.settingsRow('Passcode auto-trust', this.hasPassphrase ? 'On' : 'Off', true, $r('app.media.ic_settings_passcode'), () => { this.setMeScreen('passcode'); })
+            Divider().color($r('sys.color.comp_divider'))
+            this.settingsRow('Tailscale IP', this.tailscaleIp.length > 0 ? this.tailscaleIp : 'Not set', true, $r('app.media.ic_settings_network'), () => { this.setMeScreen('network'); })
           }
           .width('100%')
           .borderRadius(16)
@@ -1859,16 +3062,19 @@ struct Index {
 
           this.sectionHeader('Support')
           Column() {
-            this.settingsRow('Diagnostics', '', true, () => { this.setMeScreen('diagnostics'); })
-            Divider().color('#00000010')
-            this.settingsRow('Activity log', `${this.syncLog.length}`, true, () => { this.setMeScreen('log'); })
+            this.settingsRow('Diagnostics', '', true, $r('app.media.ic_settings_diagnostics'), () => { this.setMeScreen('diagnostics'); })
+            Divider().color($r('sys.color.comp_divider'))
+            this.settingsRow('Activity log', `${this.syncLog.length}`, true, $r('app.media.ic_settings_log'), () => { this.setMeScreen('log'); })
           }
           .width('100%')
           .borderRadius(16)
           .backgroundColor($r('sys.color.comp_background_list_card'))
         }
         .width('100%')
-        .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+        // topInsetVp restored - meTab's Navigation is no longer shifted as
+        // a whole (see meTab's comment), so "Me" needs its own clearance
+        // again to stay readable below the status bar.
+        .padding({ left: 16, right: 16, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
@@ -1876,32 +3082,28 @@ struct Index {
       .align(Alignment.Top)
       .edgeEffect(EdgeEffect.Spring)
       .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.START)))
-    } else if (this.meScreen === 'pairing') {
-      this.pairingScreen()
-    } else if (this.meScreen === 'passcode') {
-      this.passcodeScreen()
-    } else if (this.meScreen === 'network') {
-      this.networkScreen()
-    } else if (this.meScreen === 'diagnostics') {
-      this.diagnosticsScreen()
-    } else {
-      this.activityLogScreen()
-    }
+      // Per Huawei's "如何实现沉浸式页面" FAQ - this Scroll's own background
+      // draws behind the status bar instead of leaving a gap; the "Me"
+      // title inside it stays clear via its own topInsetVp padding above.
+      .backgroundColor($r('sys.color.background_secondary'))
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   // Pairing: QR display + scan, mirrors Windows's QrCodeForm/
   // TrustDeviceForm pair but adapted to a device that actually has a
-  // camera - scanning replaces Windows's paste-the-key fallback.
+  // camera - scanning replaces Windows's paste-the-key fallback. The back
+  // header used to be the first child here (this.subScreenHeader('Pairing'))
+  // - it's now supplied via subScreenDestination's .title() instead (see
+  // mePageMap), so this is just the scrollable body.
   @Builder
-  pairingScreen() {
+  pairingScreenContent() {
     Scroll() {
       Column({ space: 16 }) {
-        this.subScreenHeader('Pairing')
         Column({ space: 8 }) {
           Text('This screen open = pairable.').fontSize(13).fontWeight(FontWeight.Medium)
           Text('A pairing request only reaches this device while this screen is open, and only completes once you tap Accept here - keep it open on BOTH devices at the same time while pairing. Leaving this screen closes the window; nothing pairs silently in the background.')
             .fontSize(12)
-            .fontColor('#999999')
+            .fontColor($r('sys.color.font_secondary'))
         }
         .width('100%')
         .padding(16)
@@ -1918,11 +3120,11 @@ struct Index {
               .backgroundColor(Color.White)
               .borderRadius(16)
           }
-          Text('Scan this on another device (with its own Pairing screen open) to find it.').fontSize(12).fontColor('#999999')
-          Button('Scan a Device\'s QR Code').fontSize(14).fontColor($r('sys.color.brand')).systemMaterial(this.buttonMaterial()).backgroundColor('#330A59F7')
-            .onClick(() => { void this.scanToPair(); })
+          Text('Scan this on another device (with its own Pairing screen open) to find it.').fontSize(12).fontColor($r('sys.color.font_secondary'))
+          Button('Scan a Device\'s QR Code').fontSize(14).fontColor($r('sys.color.brand')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
+            .onClick(() => { tapHaptic(); void this.scanToPair(); })
           if (this.scanStatus.length > 0) {
-            Text(this.scanStatus).fontSize(12).fontColor('#666666')
+            Text(this.scanStatus).fontSize(12).fontColor($r('sys.color.font_secondary'))
           }
         }
         .width('100%')
@@ -1940,7 +3142,7 @@ struct Index {
           Text('Pair by address').fontSize(14).fontWeight(FontWeight.Medium)
           Text('No camera on the other device (e.g. Windows)? Type or paste its address - or its pairing text copied below - here instead.')
             .fontSize(12)
-            .fontColor('#999999')
+            .fontColor($r('sys.color.font_secondary'))
           TextInput({ placeholder: 'e.g. 100.x.x.x or pasted pairing text', text: this.pairByAddressInput })
             .type(InputType.Normal)
             .fontSize(14)
@@ -1949,10 +3151,10 @@ struct Index {
           Button(this.pairingInProgress ? 'Connecting...' : 'Pair by Address')
             .fontSize(14)
             .fontColor($r('sys.color.brand'))
+            .backgroundColor($r('sys.color.comp_emphasize_secondary'))
             .systemMaterial(this.buttonMaterial())
-            .backgroundColor('#330A59F7')
             .enabled(!this.pairingInProgress)
-            .onClick(() => { void this.pairByAddress(); })
+            .onClick(() => { tapHaptic(); void this.pairByAddress(); })
         }
         .width('100%')
         .padding(16)
@@ -1964,10 +3166,10 @@ struct Index {
           Text('This device\'s pairing info').fontSize(14).fontWeight(FontWeight.Medium)
           Text('Copy this and send it to the other device (e.g. paste it into ITS Pair by Address field above) so it knows where to find this one.')
             .fontSize(12)
-            .fontColor('#999999')
-          Button('Copy Pairing Info').fontSize(14).fontColor($r('sys.color.brand')).systemMaterial(this.buttonMaterial()).backgroundColor('#330A59F7')
+            .fontColor($r('sys.color.font_secondary'))
+          Button('Copy Pairing Info').fontSize(14).fontColor($r('sys.color.brand')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
             .enabled(this.myPairingPayload.length > 0)
-            .onClick(() => { void this.copyPairingPayload(); })
+            .onClick(() => { tapHaptic(); void this.copyPairingPayload(); })
         }
         .width('100%')
         .padding(16)
@@ -1976,7 +3178,12 @@ struct Index {
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+      // topInsetVp + a fixed offset here: BarStyle.STACK floats the title
+      // bar over this content rather than reserving space for it, so this
+      // padding is what keeps the initial view starting below the bar
+      // instead of hidden under it - scrolling still passes content
+      // behind it afterward, which is the point of STACK over STANDARD.
+      .padding({ left: 16, right: 16, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
       .alignItems(HorizontalAlign.Center)
     }
     .width('100%')
@@ -1984,20 +3191,22 @@ struct Index {
     .align(Alignment.Top)
     .edgeEffect(EdgeEffect.Spring)
     .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .backgroundColor($r('sys.color.background_secondary'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   // Passcode auto-trust: mirrors Windows's PasscodeForm/PassphraseAuth -
   // any device that later enters the same passcode auto-trusts this one
-  // over the LAN beacon, no QR needed.
+  // over the LAN beacon, no QR needed. Back header moved to
+  // subScreenDestination's .title() - see pairingScreenContent's comment.
   @Builder
-  passcodeScreen() {
+  passcodeScreenContent() {
     Scroll() {
       Column({ space: 16 }) {
-        this.subScreenHeader('Passcode auto-trust')
         Column({ space: 10 }) {
-          Text('Devices entering the same passcode trust each other automatically.').fontSize(12).fontColor('#999999')
+          Text('Devices entering the same passcode trust each other automatically.').fontSize(12).fontColor($r('sys.color.font_secondary'))
           if (this.hasPassphrase) {
-            Text('Passcode is set on this device.').fontSize(13).fontColor('#16A34A')
+            Text('Passcode is set on this device.').fontSize(13).fontColor($r('sys.color.confirm'))
           } else {
             TextInput({ placeholder: 'Enter a shared passcode', text: this.passphraseInput })
               .type(InputType.Password)
@@ -2007,10 +3216,10 @@ struct Index {
             Button(this.settingPassphrase ? 'Setting...' : 'Set Passcode')
               .fontSize(14)
               .fontColor($r('sys.color.brand'))
+              .backgroundColor($r('sys.color.comp_emphasize_secondary'))
               .systemMaterial(this.buttonMaterial())
-              .backgroundColor('#330A59F7')
               .enabled(!this.settingPassphrase)
-              .onClick(() => { void this.setPassphrase(); })
+              .onClick(() => { tapHaptic(); void this.setPassphrase(); })
           }
         }
         .width('100%')
@@ -2020,7 +3229,8 @@ struct Index {
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+      // No topInsetVp compensation - see pairingScreenContent's comment.
+      .padding({ left: 16, right: 16, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -2028,6 +3238,8 @@ struct Index {
     .align(Alignment.Top)
     .edgeEffect(EdgeEffect.Spring)
     .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .backgroundColor($r('sys.color.background_secondary'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   // HarmonyOS has no sandboxed way to ask the Tailscale app for this
@@ -2037,13 +3249,14 @@ struct Index {
   // gets broadcast in the LAN beacon and the QR/manual pairing payload
   // exactly like Windows's auto-detected one would, so other devices can
   // cache it and reconnect over it once you're off the same LAN.
+  // Back header moved to subScreenDestination's .title() - see
+  // pairingScreenContent's comment.
   @Builder
-  networkScreen() {
+  networkScreenContent() {
     Scroll() {
       Column({ space: 16 }) {
-        this.subScreenHeader('Tailscale IP')
         Column({ space: 10 }) {
-          Text('HarmonyOS can\'t detect this automatically - copy your tailnet IP from the Tailscale app and paste it here so other devices can reach this one off your local network.').fontSize(12).fontColor('#999999')
+          Text('HarmonyOS can\'t detect this automatically - copy your tailnet IP from the Tailscale app and paste it here so other devices can reach this one off your local network.').fontSize(12).fontColor($r('sys.color.font_secondary'))
           TextInput({ placeholder: 'e.g. 100.x.x.x', text: this.tailscaleIp })
             .type(InputType.Normal)
             .fontSize(14)
@@ -2052,10 +3265,10 @@ struct Index {
           Button(this.savingTailscaleIp ? 'Saving...' : 'Save')
             .fontSize(14)
             .fontColor($r('sys.color.brand'))
+            .backgroundColor($r('sys.color.comp_emphasize_secondary'))
             .systemMaterial(this.buttonMaterial())
-            .backgroundColor('#330A59F7')
             .enabled(!this.savingTailscaleIp)
-            .onClick(() => { void this.saveTailscaleIp(); })
+            .onClick(() => { tapHaptic(); void this.saveTailscaleIp(); })
         }
         .width('100%')
         .padding(16)
@@ -2064,7 +3277,8 @@ struct Index {
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+      // No topInsetVp compensation - see pairingScreenContent's comment.
+      .padding({ left: 16, right: 16, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -2072,24 +3286,28 @@ struct Index {
     .align(Alignment.Top)
     .edgeEffect(EdgeEffect.Spring)
     .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .backgroundColor($r('sys.color.background_secondary'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
+  // Back header moved to subScreenDestination's .title() - see
+  // pairingScreenContent's comment.
   @Builder
-  diagnosticsScreen() {
+  diagnosticsScreenContent() {
     Scroll() {
       Column({ space: 16 }) {
-        this.subScreenHeader('Diagnostics')
         Column() {
-          this.settingsRow('Run self-test', '', false, () => { void this.runSelfTest(); })
-          Divider().color('#00000010')
-          this.settingsRow('Immersive material', this.immersiveSupported ? 'Supported' : 'Not supported', false, () => {})
+          this.settingsRow('Run self-test', '', false, $r('app.media.ic_settings_diagnostics'), () => { void this.runSelfTest(); })
+          Divider().color($r('sys.color.comp_divider'))
+          this.settingsRow('Immersive material', this.immersiveSupported ? 'Supported' : 'Not supported', false, $r('app.media.ic_settings_diagnostics'), () => {})
         }
         .width('100%')
         .borderRadius(16)
         .backgroundColor($r('sys.color.comp_background_list_card'))
       }
       .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+      // No topInsetVp compensation - see pairingScreenContent's comment.
+      .padding({ left: 16, right: 16, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -2097,22 +3315,24 @@ struct Index {
     .align(Alignment.Top)
     .edgeEffect(EdgeEffect.Spring)
     .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .backgroundColor($r('sys.color.background_secondary'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   // syncLog is where every connect/disconnect/trust/untrust/auto-trust
   // event gets recorded (see e.g. untrustDevice, connectToBeacon,
-  // maybeAutoTrustViaPassphrase).
+  // maybeAutoTrustViaPassphrase). Back header moved to
+  // subScreenDestination's .title() - see pairingScreenContent's comment.
   @Builder
-  activityLogScreen() {
+  activityLogScreenContent() {
     Scroll() {
       Column({ space: 16 }) {
-        this.subScreenHeader('Activity log')
         if (this.syncLog.length === 0) {
-          Text('Nothing logged yet.').fontSize(12).fontColor('#999999')
+          Text('Nothing logged yet.').fontSize(12).fontColor($r('sys.color.font_secondary'))
         } else {
           Column({ space: 6 }) {
             ForEach(this.syncLog, (line: string, index: number) => {
-              Text(line).fontSize(12).fontColor('#999999')
+              Text(line).fontSize(12).fontColor($r('sys.color.font_secondary'))
             }, (line: string, index: number) => `${index}-${line}`)
           }
           .width('100%')
@@ -2123,7 +3343,8 @@ struct Index {
         }
       }
       .width('100%')
-      .padding({ left: 16, right: 16, top: this.topInsetVp + 16, bottom: this.bottomInsetVp + 80 })
+      // No topInsetVp compensation - see pairingScreenContent's comment.
+      .padding({ left: 16, right: 16, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
       .alignItems(HorizontalAlign.Start)
     }
     .width('100%')
@@ -2131,6 +3352,8 @@ struct Index {
     .align(Alignment.Top)
     .edgeEffect(EdgeEffect.Spring)
     .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .backgroundColor($r('sys.color.background_secondary'))
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
   // Root cause of the persistently-unreadable tab labels, found in Huawei's
@@ -2143,10 +3366,29 @@ struct Index {
   // the material at all. Switching to the framework's own tab-bar-style
   // class, with colorInvert: true on the material, is what actually makes
   // this work per the sample.
-  tabBarStyle(text: string): BottomTabBarStyle {
-    return BottomTabBarStyle.of($r('sys.media.ohos_icon_mask_svg'), text)
-      .labelStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_primary') })
-      .iconStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_primary') });
+  // Real per-tab icons now, filled when that tab is selected. Every tab
+  // previously passed the same sys.media.ohos_icon_mask_svg placeholder,
+  // which is why all three rendered as identical blank rounded squares.
+  tabBarStyle(text: string, index: number): BottomTabBarStyle {
+    // Filled artwork for BOTH states, differentiated only by colour.
+    // The outline variants are stroke-only (fill="none"), but the tab bar
+    // rasterises icons as filled shapes - so the clipboard's outer rect
+    // came out as a solid black square rather than an outline, which is
+    // the "black blob" in the unselected tabs and the dark shape that
+    // flashes mid-transition. Filled art renders correctly under that
+    // treatment; state now reads from colour, which is the more common
+    // tab-bar convention anyway.
+    let icon: Resource;
+    if (index === 0) {
+      icon = $r('app.media.ic_tab_synced_filled');
+    } else if (index === 1) {
+      icon = $r('app.media.ic_tab_devices_filled');
+    } else {
+      icon = $r('app.media.ic_tab_me_filled');
+    }
+    return BottomTabBarStyle.of(icon, text)
+      .labelStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_secondary') })
+      .iconStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_secondary') });
   }
 
   build() {
@@ -2163,11 +3405,11 @@ struct Index {
       //   fighting that built-in behavior instead of relying on it.
       Tabs({ index: this.currentTabIndex, barPosition: BarPosition.End }) {
         TabContent() { this.syncedTab() }
-          .tabBar(this.tabBarStyle('Synced'))
+          .tabBar(this.tabBarStyle('Synced', 0))
         TabContent() { this.devicesTab() }
-          .tabBar(this.tabBarStyle('Devices'))
+          .tabBar(this.tabBarStyle('Devices', 1))
         TabContent() { this.meTab() }
-          .tabBar(this.tabBarStyle('Me'))
+          .tabBar(this.tabBarStyle('Me', 2))
       }
       // Off: a left/right swipe on the Synced tab is claimed by the zoomed
       // image's pan gesture (see zoomableImage) - if Tabs also treated that
@@ -2178,40 +3420,43 @@ struct Index {
       .barOverlap(true)
       .barFloatingStyle({
         adaptToHandedness: true,
-        // maskColor/maskHeight fade list content into the floating bar's
-        // material rather than letting it cut off abruptly underneath -
-        // the "gradient blur" edge treatment the immersive material doc's
-        // samples use around floating system bars.
-        maskColor: Color.Transparent,
-        maskHeight: 24,
+        // ULTRA_THIN with applyShadow off, matching the official
+        // barFloatingStyle sample. THIN + applyShadow drew a hard white
+        // rim highlight right around the pill, which against a light page
+        // read as an outline drawn on the bar rather than as material.
+        // The thinner style keeps the frost and the colour inversion but
+        // drops that ring.
         systemMaterial: new uiMaterial.ImmersiveMaterial({
-          style: uiMaterial.ImmersiveStyle.THIN,
-          applyShadow: true,
+          style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
+          applyShadow: false,
           interactive: true,
-          // One accent color reused everywhere (see buttonMaterial) instead
-          // of the default white light-follows-finger glow.
           lightEffect: { color: $r('sys.color.brand') },
-          // Needs THIN or ULTRA_THIN to take effect (see doc comment above) -
-          // THIN is already what we use, so this was a one-line gap the whole time.
           colorInvert: true,
         }),
       })
       .width('100%')
       .height('100%')
       .onChange((index: number) => { this.currentTabIndex = index; })
+      .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
 
-      // Status bar treatment: the app draws edge-to-edge (see
-      // EntryAbility.ets's setWindowLayoutFullScreen), so without this the
-      // area behind the status bar icons is just raw scrolling content -
-      // this gives it the same immersive-material blur as the bottom bar,
-      // for a consistent top/bottom edge treatment.
-      Row()
-        .width('100%')
-        .height(this.topInsetVp)
-        .systemMaterial(new uiMaterial.ImmersiveMaterial({ style: uiMaterial.ImmersiveStyle.ULTRA_THIN, colorInvert: true }))
-        .hitTestBehavior(HitTestMode.Transparent)
+      // Mounted as a sibling of Tabs, not inside a tab's content: it has to
+      // sit above the floating tab pill in z-order and be positioned
+      // against the real screen bottom, and only the root Stack spans
+      // that. Synced-only, since pasting is meaningless on Devices/Me.
+      if (this.currentTabIndex === 1) {
+        this.addDeviceFab()
+      }
     }
     .width('100%')
     .height('100%')
+    // Status bar treatment: removed the old decorative strip entirely
+    // instead of trying to fake a blur over it. Per Huawei's own "如何实现
+    // 沉浸式页面" FAQ, the correct pattern for a fullscreen window
+    // (EntryAbility.ets's setWindowLayoutFullScreen) isn't a separate bar -
+    // it's letting the actual scrollable content's own background draw
+    // through via expandSafeArea (see syncedListContent/meMainContent/
+    // devicesTab/itemDetailView), the same way real apps show list cards
+    // or images genuinely visible behind the status bar icons, rather than
+    // a flat rectangle pretending to blur nothing behind it.
   }
 }

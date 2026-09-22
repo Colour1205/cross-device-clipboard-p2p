@@ -362,8 +362,25 @@ class Program
         conn.MessageReceived += msg => HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
         conn.Disconnected += () =>
         {
-            connectionsByDeviceId.TryRemove(conn.PeerDeviceId, out _);
-            Console.WriteLine($"[conn] disconnected: {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}... ({connectionsByDeviceId.Count} total)");
+            // Identity-checked removal, NOT TryRemove(key). When both ends
+            // dial each other at once, the second connection replaces the
+            // first in this map; removing by key alone meant the first
+            // one's eventual teardown evicted the SECOND, live connection.
+            // Both sides then believed they were disconnected and redialled,
+            // which is the connect/disconnect flapping in the console and
+            // why the clipboard stopped flowing - the map sat empty even
+            // though a healthy socket existed. This overload only removes
+            // the entry if it still points at this exact connection.
+            bool removed = connectionsByDeviceId.TryRemove(
+                new KeyValuePair<string, PeerConnection>(conn.PeerDeviceId, conn));
+            if (removed)
+            {
+                Console.WriteLine($"[conn] disconnected: {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}... ({connectionsByDeviceId.Count} total)");
+            }
+            else
+            {
+                Console.WriteLine($"[conn] stale link closed for {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}...; live connection kept ({connectionsByDeviceId.Count} total)");
+            }
         };
         _ = conn.Listen();
     }

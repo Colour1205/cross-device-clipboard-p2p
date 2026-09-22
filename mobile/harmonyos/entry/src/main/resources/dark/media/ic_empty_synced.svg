@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" fill="none">
+  <!-- Accent glow / subtle background disc -->
+  <circle cx="60" cy="64" r="44" fill="#0A59F7" fill-opacity="0.06"/>
+  <!-- Clipboard board -->
+  <rect x="36" y="30" width="48" height="64" rx="8" stroke="#8A8A8A" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Clip top -->
+  <path d="M50 30V24C50 21.7909 51.7909 20 54 20H66C68.2091 20 70 21.7909 70 24V30" stroke="#8A8A8A" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Empty placeholder dashed slots -->
+  <line x1="48" y1="48" x2="72" y2="48" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.45"/>
+  <line x1="48" y1="60" x2="72" y2="60" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.35"/>
+  <line x1="48" y1="72" x2="64" y2="72" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.25"/>
+  <!-- Waiting peer signal radar arcs (accent brand blue) -->
+  <path d="M88 44C92 48 94 53 94 60C94 67 92 72 88 76" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M96 38C102 44 105 51 105 60C105 69 102 76 96 82" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.4"/>
+  <path d="M32 44C28 48 26 53 26 60C26 67 28 72 32 76" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M24 38C18 44 15 51 15 60C15 69 18 76 24 82" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.4"/>
+</svg>

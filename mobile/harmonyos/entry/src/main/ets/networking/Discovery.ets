@@ -94,12 +94,24 @@ export class Discovery {
     }, SEND_INTERVAL_MS);
   }
 
-  stop(): void {
+  // Awaits the socket close instead of firing it off. A caller that stops
+  // and immediately restarts discovery (see Index.ets's onPageShow) would
+  // otherwise race the old socket's release and get EADDRINUSE from the
+  // new bind on the same fixed port - which killed discovery for the rest
+  // of the session, because the failed start was never retried.
+  async stop(): Promise<void> {
     if (this.sendTimerId !== -1) {
       clearInterval(this.sendTimerId);
       this.sendTimerId = -1;
     }
-    this.udp?.close().catch(() => { /* already closed or never opened - fine */ });
+    const udp = this.udp;
     this.udp = null;
+    if (udp !== null) {
+      try {
+        await udp.close();
+      } catch (e) {
+        // already closed or never opened - fine
+      }
+    }
   }
 }
