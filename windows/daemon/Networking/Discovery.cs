@@ -13,7 +13,7 @@ namespace ClipboardDaemon.Networking;
 public class Discovery
 {
     // TODO
-    public int PORT = 52388;
+    public int PORT = 49000;
 
     // getProof is called fresh on every beacon, not just once at startup — a
     // passphrase set later via the tray (the normal flow: daemon starts first,

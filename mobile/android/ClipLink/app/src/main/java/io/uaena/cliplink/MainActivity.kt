@@ -1,87 +1,268 @@
 package io.uaena.cliplink
 
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.view.Menu
-import android.view.MenuItem
-import com.google.android.material.snackbar.Snackbar
-import com.google.android.material.navigation.NavigationView
-import androidx.navigation.findNavController
-import androidx.navigation.fragment.NavHostFragment
-import androidx.navigation.ui.AppBarConfiguration
-import androidx.navigation.ui.navigateUp
-import androidx.navigation.ui.setupActionBarWithNavController
-import androidx.navigation.ui.setupWithNavController
-import androidx.appcompat.app.AppCompatActivity
-import io.uaena.cliplink.databinding.ActivityMainBinding
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.lifecycleScope
+import io.uaena.cliplink.clipboard.ClipboardBridge
+import io.uaena.cliplink.core.ClipboardEntry
+import io.uaena.cliplink.engine.ClipLinkEngine
+import io.uaena.cliplink.engine.SyncedItem
+import io.uaena.cliplink.service.ClipLinkService
+import io.uaena.cliplink.ui.AppActions
+import io.uaena.cliplink.ui.AppState
+import io.uaena.cliplink.ui.ClipLinkApp
+import io.uaena.cliplink.ui.MeActions
+import io.uaena.cliplink.ui.SyncedActions
+import io.uaena.cliplink.ui.theme.ClipLinkTheme
+import kotlinx.coroutines.launch
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
-    private lateinit var appBarConfiguration: AppBarConfiguration
-    private lateinit var binding: ActivityMainBinding
+    private val engine: ClipLinkEngine by lazy { ClipLinkApplication.engine() }
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { granted ->
+        // ACCESS_LOCAL_NETWORK being denied doesn't produce an error anywhere -
+        // UDP sends fail with EPERM and TCP dials just hang - so it has to be
+        // called out here or it presents as "no devices exist".
+        if (granted[Manifest.permission.ACCESS_LOCAL_NETWORK] == false) {
+            engine.showToast(
+                "Local network access is off, so ClipLink can't find your devices. " +
+                    "Turn it on in App info → Permissions → Nearby devices.",
+            )
+        }
+    }
+
+    private val pickFileLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> uri?.let { engine.shareIn(null, it) } }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
-        setSupportActionBar(binding.appBarMain.toolbar)
 
-        binding.appBarMain.fab?.setOnClickListener { view ->
-            Snackbar.make(view, "Replace with your own action", Snackbar.LENGTH_LONG)
-                .setAction("Action", null)
-                .setAnchorView(R.id.fab).show()
-        }
+        engine.start()
+        requestPermissions()
+        if (engine.deviceSettings.keepAlive) ClipLinkService.start(this)
+        handleShareIntent(intent)
 
-        val navHostFragment =
-            (supportFragmentManager.findFragmentById(R.id.nav_host_fragment_content_main) as NavHostFragment?)!!
-        val navController = navHostFragment.navController
+        setContent {
+            val dynamicColor = remember { mutableStateOf(engine.deviceSettings.dynamicColor) }
 
-        binding.navView?.let {
-            appBarConfiguration = AppBarConfiguration(
-                setOf(
-                    R.id.nav_transform, R.id.nav_reflow, R.id.nav_slideshow, R.id.nav_settings
-                ),
-                binding.drawerLayout
-            )
-            setupActionBarWithNavController(navController, appBarConfiguration)
-            it.setupWithNavController(navController)
-        }
+            ClipLinkTheme(dynamicColor = dynamicColor.value) {
+                val items by engine.items.collectAsState()
+                val devices by engine.devices.collectAsState()
+                val connectedCount by engine.connectedCount.collectAsState()
+                val discovering by engine.discoveryRunning.collectAsState()
+                val ownDeviceId by engine.ownDeviceId.collectAsState()
+                val pairingRequest by engine.pairingRequest.collectAsState()
+                val hasPassphrase by engine.hasPassphrase.collectAsState()
+                val tailscaleIp by engine.tailscaleIp.collectAsState()
+                val toast by engine.toast.collectAsState()
+                val log by engine.log.collectAsState()
 
-        binding.appBarMain.contentMain.bottomNavView?.let {
-            appBarConfiguration = AppBarConfiguration(
-                setOf(
-                    R.id.nav_transform, R.id.nav_reflow, R.id.nav_slideshow
+                var keepAlive by remember { mutableStateOf(engine.deviceSettings.keepAlive) }
+                var autoApply by remember { mutableStateOf(engine.deviceSettings.autoApply) }
+                var autoCapture by remember { mutableStateOf(engine.deviceSettings.autoCapture) }
+                var pairStatus by remember { mutableStateOf("") }
+
+                ClipLinkApp(
+                    state = AppState(
+                        items = items,
+                        devices = devices,
+                        connectedCount = connectedCount,
+                        discovering = discovering,
+                        ownDeviceId = ownDeviceId,
+                        pairingPayload = engine.pairingPayload(),
+                        pairingRequest = pairingRequest,
+                        hasPassphrase = hasPassphrase,
+                        tailscaleIp = tailscaleIp,
+                        keepAlive = keepAlive,
+                        autoApply = autoApply,
+                        autoCapture = autoCapture,
+                        dynamicColor = dynamicColor.value,
+                        localAddresses = remember(ownDeviceId) { engine.localAddresses() },
+                        log = log,
+                        toast = toast,
+                    ),
+                    pairStatus = pairStatus,
+                    actions = AppActions(
+                        synced = SyncedActions(
+                            onOpen = {},
+                            onCopy = { item ->
+                                if (engine.applyToClipboard(item)) {
+                                    engine.showToast("Copied.")
+                                } else {
+                                    engine.showToast("Couldn't copy that item.")
+                                }
+                            },
+                            onShare = ::shareItem,
+                            onDelete = engine::deleteItem,
+                            onSyncClipboard = engine::captureAndBroadcast,
+                            onPickFile = { pickFileLauncher.launch(arrayOf("*/*")) },
+                        ),
+                        me = MeActions(
+                            onSetPassphrase = { passphrase ->
+                                lifecycleScope.launch {
+                                    if (engine.setPassphrase(passphrase)) {
+                                        engine.showToast("Passcode set — matching devices will auto-trust.")
+                                    }
+                                }
+                            },
+                            onClearPassphrase = {
+                                engine.clearPassphrase()
+                                engine.showToast("Passcode cleared.")
+                            },
+                            onSaveTailscaleIp = engine::saveTailscaleIp,
+                            onKeepAliveChange = { enabled ->
+                                keepAlive = enabled
+                                engine.deviceSettings.keepAlive = enabled
+                                if (enabled) ClipLinkService.start(this) else ClipLinkService.stop(this)
+                            },
+                            onAutoApplyChange = { enabled ->
+                                autoApply = enabled
+                                engine.deviceSettings.autoApply = enabled
+                            },
+                            onAutoCaptureChange = { enabled ->
+                                autoCapture = enabled
+                                engine.deviceSettings.autoCapture = enabled
+                            },
+                            onDynamicColorChange = { enabled ->
+                                dynamicColor.value = enabled
+                                engine.deviceSettings.dynamicColor = enabled
+                            },
+                            onClearHistory = engine::clearHistory,
+                            onCopyDeviceId = {
+                                copyPlainText(ownDeviceId)
+                                engine.showToast("Device ID copied.")
+                            },
+                        ),
+                        onTrust = { engine.trustDevice(it.deviceId) },
+                        onUntrust = { engine.untrustDevice(it.deviceId) },
+                        onPairingOpenChange = { open ->
+                            engine.setPairingOpen(open)
+                            if (!open) pairStatus = ""
+                        },
+                        onPair = { raw ->
+                            lifecycleScope.launch {
+                                pairStatus = "Connecting…"
+                                pairStatus = engine.pairWith(raw)
+                            }
+                        },
+                        onAcceptPairing = engine::acceptPairing,
+                        onRejectPairing = engine::rejectPairing,
+                        onToastShown = engine::consumeToast,
+                    ),
                 )
-            )
-            setupActionBarWithNavController(navController, appBarConfiguration)
-            it.setupWithNavController(navController)
-        }
-    }
-
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        val result = super.onCreateOptionsMenu(menu)
-        // Using findViewById because NavigationView exists in different layout files
-        // between w600dp and w1240dp
-        val navView: NavigationView? = findViewById(R.id.nav_view)
-        if (navView == null) {
-            // The navigation drawer already has the items including the items in the overflow menu
-            // We only inflate the overflow menu if the navigation drawer isn't visible
-            menuInflater.inflate(R.menu.overflow, menu)
-        }
-        return result
-    }
-
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        when (item.itemId) {
-            R.id.nav_settings -> {
-                val navController = findNavController(R.id.nav_host_fragment_content_main)
-                navController.navigate(R.id.nav_settings)
             }
         }
-        return super.onOptionsItemSelected(item)
     }
 
-    override fun onSupportNavigateUp(): Boolean {
-        val navController = findNavController(R.id.nav_host_fragment_content_main)
-        return navController.navigateUp(appBarConfiguration) || super.onSupportNavigateUp()
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Foregrounding is the other moment besides a cold start that deserves
+        // an immediate reconnect: a backgrounded app's UDP socket can be torn
+        // down by the OS without any error surfacing.
+        engine.onForeground()
+    }
+
+    @SuppressLint("InlinedApi")
+    private fun requestPermissions() {
+        val wanted = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= 37) {
+            wanted += Manifest.permission.ACCESS_LOCAL_NETWORK
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            wanted += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (wanted.isNotEmpty()) {
+            permissionLauncher.launch(wanted.toTypedArray())
+        }
+    }
+
+    /** Handles ACTION_SEND - the way to push something without opening the app first. */
+    private fun handleShareIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_SEND) return
+        // The typed getParcelableExtra overload is API 33+, and minSdk here is
+        // 31 - calling it unconditionally is a NoSuchMethodError on Android 12
+        // the first time anything is shared in.
+        @Suppress("DEPRECATION")
+        val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM) as? Uri
+        }
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        if (uri == null && text.isNullOrEmpty()) return
+        engine.shareIn(text, uri)
+        // Cleared so a configuration change doesn't re-send the same item.
+        intent.action = null
+    }
+
+    private fun shareItem(item: SyncedItem) {
+        val send = Intent(Intent.ACTION_SEND).apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        when (item.type) {
+            ClipboardEntry.TYPE_TEXT -> {
+                send.type = "text/plain"
+                send.putExtra(Intent.EXTRA_TEXT, item.entry.content)
+            }
+
+            ClipboardEntry.TYPE_IMAGE -> {
+                val bytes = io.uaena.cliplink.core.B64.decodeOrNull(item.entry.content) ?: return
+                val hash = io.uaena.cliplink.store.FileStore.hashOf(bytes)
+                if (!engine.fileStore.exists(hash)) engine.fileStore.write(hash, bytes)
+                send.type = "image/png"
+                send.putExtra(
+                    Intent.EXTRA_STREAM,
+                    engine.clipboard.contentUriFor(engine.fileStore.path(hash), "$hash.png"),
+                )
+            }
+
+            ClipboardEntry.TYPE_FILE -> {
+                val payload = item.filePayload ?: return
+                if (!engine.fileStore.exists(payload.fileHash)) {
+                    engine.showToast("That file hasn't finished transferring yet.")
+                    return
+                }
+                send.type = ClipboardBridge.guessMimeType(payload.fileName)
+                send.putExtra(
+                    Intent.EXTRA_STREAM,
+                    engine.clipboard.contentUriFor(
+                        engine.fileStore.path(payload.fileHash),
+                        payload.fileName,
+                    ),
+                )
+            }
+
+            else -> return
+        }
+        startActivity(Intent.createChooser(send, "Share"))
+    }
+
+    private fun copyPlainText(text: String) {
+        val manager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        manager.setPrimaryClip(ClipData.newPlainText("ClipLink", text))
     }
 }

@@ -13,7 +13,7 @@ import socket from '@ohos.net.socket';
 import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
 
-const PORT = 52388;
+const PORT = 49000;
 const BROADCAST_ADDRESS = '255.255.255.255';
 const SEND_INTERVAL_MS = 2000;
 

@@ -519,7 +519,7 @@ class Program
     static async Task Main(String[] args)
     {
         string label = args.Length > 0 ? args[0] : "default";
-        string port = args.Length > 1 ? args[1] : "52388";
+        string port = args.Length > 1 ? args[1] : "49000";
         string? trustedKeyToAdd = args.Length > 2 ? args[2] : null;
 
         var identity = new DeviceIdentity(label);

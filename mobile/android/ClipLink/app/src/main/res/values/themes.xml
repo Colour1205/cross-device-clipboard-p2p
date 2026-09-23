@@ -1,25 +1,18 @@
-<resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme. -->
-    <style name="Theme.ClipLink" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
-        <!-- Primary brand color. -->
-        <item name="colorPrimary">@color/purple_500</item>
-        <item name="colorPrimaryVariant">@color/purple_700</item>
-        <item name="colorOnPrimary">@color/white</item>
-        <!-- Secondary brand color. -->
-        <item name="colorSecondary">@color/teal_200</item>
-        <item name="colorSecondaryVariant">@color/teal_700</item>
-        <item name="colorOnSecondary">@color/black</item>
-        <!-- Status bar color. -->
-        <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
-        <!-- Customize your theme here. -->
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Everything visual is decided in Compose (see ui/theme/Theme.kt) -
+         this platform theme only exists to give the window itself sane
+         defaults before the first frame: no action bar, and fully
+         transparent system bars so enableEdgeToEdge()'s content can draw
+         all the way behind them. Deliberately NOT a Material Components
+         theme: those views aren't used at all, and inheriting one would
+         drag AppCompat back in for nothing. -->
+    <style name="Theme.ClipLink" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
     </style>
-
-    <style name="Theme.ClipLink.NoActionBar">
-        <item name="windowActionBar">false</item>
-        <item name="windowNoTitle">true</item>
-    </style>
-
-    <style name="Theme.ClipLink.AppBarOverlay" parent="ThemeOverlay.AppCompat.Dark.ActionBar" />
-
-    <style name="Theme.ClipLink.PopupOverlay" parent="ThemeOverlay.AppCompat.Light" />
 </resources>

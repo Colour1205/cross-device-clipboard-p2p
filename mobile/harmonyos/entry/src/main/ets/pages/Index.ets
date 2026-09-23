@@ -49,7 +49,7 @@ import socket from '@ohos.net.socket';
 const base64Helper = new util.Base64Helper();
 
 // Must match Program.cs's own default TCP port (args[1], defaulting to
-// "52388" when the tray launcher starts it - see DaemonLauncher.cs, which
+// "49000" when the tray launcher starts it - see DaemonLauncher.cs, which
 // only ever passes the label, never a port override). On the LAN this
 // constant is irrelevant - the real listening port is always exchanged
 // live via the discovery beacon's tcpPort field. Off-LAN (see
@@ -58,7 +58,7 @@ const base64Helper = new util.Base64Helper();
 // assume the other's default is - if these two numbers disagree, every
 // off-LAN reconnect attempt silently dials the wrong port and never
 // connects, with nothing in the log to say why.
-const TCP_PORT = 52388;
+const TCP_PORT = 49000;
 
 // Visible via `hdc shell hilog` - unlike Windows's Console.WriteLine, this
 // app previously had NO console-visible debug output for its networking

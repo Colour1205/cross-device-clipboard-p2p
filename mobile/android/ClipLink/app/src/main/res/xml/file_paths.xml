@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Content-addressed blob cache (FileStore). Exposed through
+         FileProvider so received files can be shared, opened, or put on
+         the clipboard as a content:// URI - a file:// URI would throw
+         FileUriExposedException the moment it left this process. -->
+    <files-path name="cliplink_files" path="cliplink_files/" />
+    <!-- Human-named copies handed to other apps (a blob's filename is its
+         hash, which is useless in a share sheet). -->
+    <cache-path name="shared" path="shared/" />
+</paths>

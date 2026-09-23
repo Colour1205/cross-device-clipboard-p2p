@@ -2,7 +2,39 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- targetSdk 37 enforces Local Network Protections: WITHOUT this
+         runtime permission every single thing this app does on the LAN
+         fails - the UDP beacon's sendto returns EPERM, incoming beacons
+         never arrive, and TCP dials to 192.168.x.x/100.64.x.x just time
+         out (they do NOT report a permission error, which is why a denial
+         looks exactly like "the peer is offline"). It is a NEARBY_DEVICES
+         group runtime permission, so it has to be requested, not just
+         declared. Apps targeting SDK 36 or lower must NOT declare it -
+         local network access is implicit in INTERNET there. -->
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
+    <!-- Held while discovery is running. Also the runtime prerequisite for
+         a connectedDevice foreground service: that type requires the app to
+         hold at least one of CHANGE_NETWORK_STATE / CHANGE_WIFI_STATE /
+         CHANGE_WIFI_MULTICAST_STATE (etc.) or startForeground throws. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- connectedDevice, NOT dataSync. dataSync is capped at 6 hours per
+         24 and then hard-crashes the app via RemoteServiceException if it
+         doesn't stop itself; connectedDevice is documented for "interactions
+         with external devices ... or network connections" and carries no
+         time limit at all, which is the only thing that makes a
+         stay-reachable clipboard link viable. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
+        android:name=".ClipLinkApplication"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -11,19 +43,54 @@
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.ClipLink">
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
             android:resizeableActivity="true"
-            android:theme="@style/Theme.ClipLink.NoActionBar"
-            tools:targetApi="24">
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.ClipLink">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Android 10+ forbids reading the clipboard outside the
+                 foreground/default-IME, so "share into ClipLink" is the
+                 real escape hatch for pushing something from another app
+                 without switching to this one first and tapping paste. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
         </activity>
+
+        <service
+            android:name=".service.ClipLinkService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>
