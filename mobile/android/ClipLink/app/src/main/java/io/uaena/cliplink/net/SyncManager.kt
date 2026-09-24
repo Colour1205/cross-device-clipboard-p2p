@@ -69,9 +69,6 @@ class SyncManager(
      * every two seconds forever, and no clipboard data ever moves.
      */
     fun registerConnection(conn: PeerConnection) {
-        connections[conn.peerDeviceId] = conn
-        onConnectionsChanged?.invoke(connections.size)
-
         conn.onMessage = { message -> scope.launch { handleMessage(message, conn) } }
         conn.onDisconnected = {
             // Evict only if the map still points at THIS connection. Removing
@@ -90,15 +87,44 @@ class SyncManager(
 
         // The window between the handshake completing and this method wiring
         // onDisconnected is small but real - a peer that vanishes inside it
-        // fired its disconnect against a null callback, so without this the
-        // entry would sit in the map forever and isConnected would keep
-        // claiming a link that is already dead.
-        if (conn.isClosed && connections.remove(conn.peerDeviceId, conn)) {
-            onConnectionsChanged?.invoke(connections.size)
-            return
-        }
+        // fired its disconnect against a null callback, and onDisconnected
+        // will never fire now that it's wired (PeerConnection.finish() is
+        // idempotent). This connection is simply dead - bail out before
+        // touching the map at all, so whatever was already registered for
+        // this peer (if anything) is left exactly as it was.
+        if (conn.isClosed) return
 
+        val previous = connections.put(conn.peerDeviceId, conn)
+        onConnectionsChanged?.invoke(connections.size)
         scope.launch { sendHistoryBatch(conn) }
+
+        if (previous != null && previous !== conn) {
+            // A second connection to this same peer just replaced the first
+            // one in the map. connectingTo already stops THIS device from
+            // dialling the same peer twice at once (see ClipLinkEngine's
+            // maybeAutoConnect/reconnectOffLanPeers), but it has no say over
+            // the PEER dialling twice, or over acceptConnection taking a
+            // second incoming socket from a peer this device is already
+            // connected to - the TCP accept loop takes every connection
+            // unconditionally, and only identifies which peer it was after
+            // the handshake finishes.
+            //
+            // Without this, `previous` was left alive as an orphan: its own
+            // read loop and heartbeat kept running even though nothing sent
+            // on it anymore, and this device's own map already points at
+            // the new connection - but the peer on the other end of that
+            // orphaned socket has no idea it's been superseded, and may
+            // still consider IT the canonical connection. That split-brain
+            // (each side treating a different one of the duplicate sockets
+            // as "the" connection) is what caused a peer's connected status
+            // to disagree with whether sync was actually working, and
+            // connections appearing to drop later - once whichever side's
+            // orphan eventually noticed the other end had stopped using it.
+            // Closing it here immediately, instead of waiting for its own
+            // heartbeat to notice, means there is only ever one live socket
+            // per peer on this end.
+            previous.close()
+        }
     }
 
     fun closeAll() {

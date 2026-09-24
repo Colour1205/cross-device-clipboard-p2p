@@ -201,6 +201,12 @@ const PING_SENTINEL = '__ping__';
 // this 9s timeout. Tightening only this end is therefore safe, and it
 // cuts how long the UI can show a stale "Connected" for a silently-dead
 // peer from ~15-20s to ~9-12s.
+//
+// (A 25s timeout was tried here and reverted - it fixed nothing for the
+// "connection still drops after a while" symptom, which has a different
+// root cause elsewhere, and it made the ORIGINAL stale-"Connected" problem
+// this heartbeat exists to fix noticeably worse. Leave these values alone
+// unless you've root-caused a problem to this specific number.)
 const HEARTBEAT_INTERVAL_MS = 3000;
 const HEARTBEAT_TIMEOUT_MS = 9000;
 

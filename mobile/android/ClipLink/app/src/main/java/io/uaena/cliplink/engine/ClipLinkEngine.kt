@@ -507,19 +507,37 @@ class ClipLinkEngine(context: Context) {
      * unilaterally trust them.
      */
     suspend fun pairWith(raw: String): String {
-        val info = PairingInfo.parse(raw) ?: return "That code was empty."
-        if (info.publicKey == _ownDeviceId.value) return "That's this device's own code."
-        val candidates = addressCandidatesFor(info.publicKey, info.address)
-        if (candidates.isEmpty()) {
-            return "${info.publicKey.take(12)}… has no address in its code. If it's on the " +
-                "same network, keep this screen open and its beacon will pair automatically."
-        }
-        for (candidate in candidates) {
-            if (connectToAddress(candidate, Protocol.TCP_PORT)) {
-                return "Reached $candidate - accept the prompt on both devices to finish."
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return "Enter a pairing code or address first."
+
+        val info = PairingInfo.parse(trimmed)
+        if (info != null) {
+            // The full {PublicKey,Address} JSON another device's pairing
+            // screen shows/copies - if this is our own, or genuinely
+            // carries no address (LAN-only device, meant to be found via
+            // its beacon instead), there's nothing to dial.
+            if (info.publicKey == _ownDeviceId.value) return "That's this device's own code."
+            val candidates = addressCandidatesFor(info.publicKey, info.address)
+            if (candidates.isEmpty()) {
+                return "${info.publicKey.take(12)}… has no address in its code. If it's on the " +
+                    "same network, keep this screen open and its beacon will pair automatically."
             }
+            for (candidate in candidates) {
+                if (connectToAddress(candidate, Protocol.TCP_PORT)) {
+                    return "Reached $candidate - accept the prompt on both devices to finish."
+                }
+            }
+            return "Couldn't reach ${candidates.joinToString(", ")}."
         }
-        return "Couldn't reach ${candidates.joinToString(", ")}."
+
+        // Not JSON - PairScreen's own hint text invites "just its IP
+        // address if it's reachable", so treat the raw input AS that
+        // address directly rather than (as this used to) silently
+        // misreading it as a bare device key with nowhere to dial.
+        if (connectToAddress(trimmed, Protocol.TCP_PORT)) {
+            return "Reached $trimmed - accept the prompt on both devices to finish."
+        }
+        return "Couldn't reach $trimmed."
     }
 
     suspend fun setPassphrase(passphrase: String): Boolean = withContext(Dispatchers.Default) {

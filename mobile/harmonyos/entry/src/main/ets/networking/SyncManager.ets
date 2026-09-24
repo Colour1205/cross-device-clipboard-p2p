@@ -111,6 +111,7 @@ export class SyncManager {
   // Program.cs runs right after both the accept loop and ConnectToPeer
   // complete a handshake.
   registerConnection(conn: PeerConnection): void {
+    const previous = this.connections.get(conn.peerDeviceId);
     this.connections.set(conn.peerDeviceId, conn);
     this.connectionsChangedCallback?.(this.connections.size);
     conn.onMessage((msg: string) => { void this.handleMessage(msg, conn); });
@@ -130,6 +131,25 @@ export class SyncManager {
     });
     conn.listen();
     void this.sendHistoryBatch(conn);
+    if (previous !== undefined && previous !== conn) {
+      // A second connection to this same peer just replaced the first one
+      // in the map (duplicate connections happen when a beacon-triggered
+      // dial races one already in flight - see the connectingTo guards in
+      // Index.ets). Without this, `previous` was left alive as an orphan:
+      // its own read loop and heartbeat kept running even though nothing
+      // sent on it anymore, and this device's own map already pointed at
+      // the new connection - but the PEER on the other end of that orphaned
+      // socket has no idea it's been superseded, and may still consider IT
+      // the canonical connection. That split-brain (each side treating a
+      // different one of the duplicate sockets as "the" connection) is what
+      // actually produced "Devices tab shows not connected, but sync still
+      // works" (the orphan was still relaying data) and connections
+      // appearing to drop later (whichever side's orphan eventually noticed
+      // the other end had stopped using it). Closing it here immediately -
+      // instead of waiting for its own heartbeat to eventually notice -
+      // means there is only ever one live socket per peer, on both ends.
+      previous.close();
+    }
   }
 
   private async sendHistoryBatch(conn: PeerConnection): Promise<void> {

@@ -3,6 +3,10 @@
     {
       "name": "start_window_background",
       "value": "#FFFFFF"
+    },
+    {
+      "name": "brand_blue",
+      "value": "#5468D4"
     }
   ]
 }

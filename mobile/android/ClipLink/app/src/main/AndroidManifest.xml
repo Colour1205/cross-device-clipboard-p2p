@@ -33,6 +33,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- For PairScreen's QR scanner. Requested at runtime only when the user
+         actually taps "Scan a Device's Code" (not eagerly at launch, like
+         the network permissions above) - pairing works fine without it via
+         "Pair by address", so there's no reason to ask upfront. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+
     <application
         android:name=".ClipLinkApplication"
         android:allowBackup="true"

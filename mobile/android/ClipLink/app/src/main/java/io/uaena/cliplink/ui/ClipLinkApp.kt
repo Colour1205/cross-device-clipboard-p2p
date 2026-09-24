@@ -87,6 +87,14 @@ fun ClipLinkApp(state: AppState, actions: AppActions, pairStatus: String) {
     var tab by remember { mutableStateOf(Tab.Synced) }
     var pairing by remember { mutableStateOf(false) }
     var detail by remember { mutableStateOf<SyncedItem?>(null) }
+    var scanning by remember { mutableStateOf(false) }
+    // Hoisted up here rather than remembered inside SyncedScreen itself -
+    // that screen gets swapped out of composition entirely (this file's
+    // single AnimatedContent below only ever has ONE of Detail/Pairing/
+    // Synced/... mounted at a time), so a locally-remembered layout choice
+    // was getting reset back to its default every time a card's detail
+    // view closed and SyncedScreen recomposed fresh. Defaults to Grid.
+    var syncedLayout by remember { mutableStateOf(SyncedLayout.Grid) }
     val snackbarHostState = remember { SnackbarHostState() }
 
     // Pairing mode is a live signal, not a setting: an untrusted peer can only
@@ -101,8 +109,9 @@ fun ClipLinkApp(state: AppState, actions: AppActions, pairStatus: String) {
         }
     }
 
-    BackHandler(enabled = detail != null || pairing) {
+    BackHandler(enabled = scanning || detail != null || pairing) {
         when {
+            scanning -> scanning = false
             detail != null -> detail = null
             else -> pairing = false
         }
@@ -115,7 +124,7 @@ fun ClipLinkApp(state: AppState, actions: AppActions, pairStatus: String) {
             // own back affordance, and leaving a tab bar visible invites
             // tapping it mid-pairing, which silently cancels the pairing
             // window the other device is waiting on.
-            if (detail == null && !pairing) {
+            if (detail == null && !pairing && !scanning) {
                 ShortNavigationBar {
                     Tab.entries.forEach { entry ->
                         ShortNavigationBarItem(
@@ -157,7 +166,7 @@ fun ClipLinkApp(state: AppState, actions: AppActions, pairStatus: String) {
             val exitFade = MaterialTheme.motionScheme.fastEffectsSpec<Float>()
 
             AnimatedContent(
-                targetState = Screen.of(detail, pairing, tab),
+                targetState = Screen.of(scanning, detail, pairing, tab),
                 transitionSpec = {
                     (fadeIn(enterFade) + scaleIn(enterScale, initialScale = 0.96f)) togetherWith
                         (fadeOut(exitFade) + scaleOut(exitFade, targetScale = 1.02f)) using
@@ -186,6 +195,16 @@ fun ClipLinkApp(state: AppState, actions: AppActions, pairStatus: String) {
                         contentPadding = padding,
                         onBack = { pairing = false },
                         onPair = actions.onPair,
+                        onScan = { scanning = true },
+                    )
+
+                    Screen.Scan -> ScanScreen(
+                        contentPadding = padding,
+                        onBack = { scanning = false },
+                        onResult = { text ->
+                            scanning = false
+                            actions.onPair(text)
+                        },
                     )
 
                     Screen.Synced -> SyncedScreen(
@@ -194,6 +213,8 @@ fun ClipLinkApp(state: AppState, actions: AppActions, pairStatus: String) {
                         discovering = state.discovering,
                         contentPadding = padding,
                         actions = actions.synced.copy(onOpen = { detail = it }),
+                        layout = syncedLayout,
+                        onLayoutChange = { syncedLayout = it },
                     )
 
                     Screen.Devices -> DevicesScreen(
@@ -238,10 +259,11 @@ fun ClipLinkApp(state: AppState, actions: AppActions, pairStatus: String) {
 }
 
 private enum class Screen {
-    Detail, Pairing, Synced, Devices, Me;
+    Scan, Detail, Pairing, Synced, Devices, Me;
 
     companion object {
-        fun of(detail: SyncedItem?, pairing: Boolean, tab: Tab): Screen = when {
+        fun of(scanning: Boolean, detail: SyncedItem?, pairing: Boolean, tab: Tab): Screen = when {
+            scanning -> Scan
             detail != null -> Detail
             pairing -> Pairing
             tab == Tab.Devices -> Devices

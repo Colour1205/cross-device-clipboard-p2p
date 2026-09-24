@@ -165,7 +165,19 @@ data class PairingInfo(val publicKey: String, val address: String?) {
     }.toString()
 
     companion object {
-        /** Accepts the JSON payload, or a bare public key, matching the daemon's trust_device command. */
+        /**
+         * Only recognizes the {PublicKey,Address} JSON payload a pairing
+         * screen's QR/"copy pairing info" produces - returns null for
+         * anything else (including a bare address), rather than guessing.
+         * A bare non-JSON string used to be treated as a bare public key
+         * (matching the Windows daemon's legacy trust_device CLI
+         * convention), but that's wrong for THIS app: PairScreen's own
+         * hint text explicitly invites "just its IP address if it's
+         * reachable", and there was never anything useful to do with a
+         * bare key alone anyway (no address means nothing to dial). See
+         * ClipLinkEngine.pairWith for how a non-JSON input is actually
+         * handled - as a literal address, not a key.
+         */
         fun parse(raw: String): PairingInfo? {
             val trimmed = raw.trim()
             if (trimmed.isEmpty()) return null
@@ -178,7 +190,7 @@ data class PairingInfo(val publicKey: String, val address: String?) {
                     PairingInfo(key, obj.optString("Address", "").takeIf { it.isNotEmpty() })
                 }
             } catch (e: Exception) {
-                PairingInfo(trimmed, null)
+                null
             }
         }
     }

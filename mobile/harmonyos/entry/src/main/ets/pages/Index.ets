@@ -650,12 +650,20 @@ struct Index {
     if (this.connectingTo.has(beacon.deviceId)) return;
     if (beacon.deviceId >= this.ownDeviceId) return;
 
-    const context = getContext(this) as common.UIAbilityContext;
-    const isTrusted = await this.trustStore.isTrusted(context, beacon.deviceId);
-    if (!isTrusted) return;
-
+    // Reserved synchronously, before the first await below - the
+    // has()-check-then-add() pair has to stay atomic from this point on, or
+    // two beacon packets for the same peer arriving close together (e.g. a
+    // burst flushed at once on resume from backgrounding) can both pass the
+    // has() check above (neither has added yet) while the first call is
+    // still awaiting trustStore.isTrusted(), and both end up dialing - a
+    // genuine duplicate connection to the same peer. See
+    // SyncManager.ets's registerConnection for what that duplicate then
+    // causes (split-brain between the two ends).
     this.connectingTo.add(beacon.deviceId);
     try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const isTrusted = await this.trustStore.isTrusted(context, beacon.deviceId);
+      if (!isTrusted) return;
       await this.connectToBeacon(beacon);
     } finally {
       this.connectingTo.delete(beacon.deviceId);
@@ -678,11 +686,13 @@ struct Index {
     if (this.pendingPairingConn !== null) return; // already have a candidate awaiting a decision
     if (beacon.deviceId >= this.ownDeviceId) return;
 
-    const context = getContext(this) as common.UIAbilityContext;
-    if (await this.trustStore.isTrusted(context, beacon.deviceId)) return; // maybeAutoConnect already handles this case
-
+    // See maybeAutoConnect's identical fix - reserved before the first
+    // await so a second beacon for the same peer can't slip through the
+    // has() check above while this call is still awaiting isTrusted().
     this.connectingTo.add(beacon.deviceId);
     try {
+      const context = getContext(this) as common.UIAbilityContext;
+      if (await this.trustStore.isTrusted(context, beacon.deviceId)) return; // maybeAutoConnect already handles this case
       await this.connectToBeacon(beacon);
     } finally {
       this.connectingTo.delete(beacon.deviceId);
@@ -1540,6 +1550,16 @@ struct Index {
     });
   }
 
+  // A plain method, not a local variable inside glassTitleBar - ArkTS's
+  // "UI component syntax" builders don't allow a variable declaration in
+  // their own body at all (even one leading statement before the first
+  // component), only real method calls used inline within the tree. This
+  // is how glassTitleBar's 'actions' trailing slot gets the item its
+  // Copy/Share buttons should act on.
+  private currentDetailItem(): SyncedItem | undefined {
+    return this.syncedItems.find(i => i.id === this.selectedItemId);
+  }
+
   // Reads syncManager.isConnected() directly; connectedCount changing is
   // what re-runs this builder
   // for why: that used to only "live update" incidentally, as a side
@@ -1638,7 +1658,7 @@ struct Index {
       style: uiMaterial.ImmersiveStyle.THIN,
       interactive: true,
       colorInvert: true,
-      lightEffect: { color: $r('sys.color.brand') },
+      lightEffect: { color: $r('app.color.brand_blue') },
     });
   }
 
@@ -1649,7 +1669,7 @@ struct Index {
     return new uiMaterial.ImmersiveMaterial({
       style: uiMaterial.ImmersiveStyle.THIN,
       interactive: true,
-      lightEffect: { color: $r('sys.color.brand') },
+      lightEffect: { color: $r('app.color.brand_blue') },
     });
   }
 
@@ -2321,6 +2341,53 @@ struct Index {
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .layoutWeight(1)
 
+      if (trailing === 'actions') {
+        // Copy/Share for the item preview page, matching what the Android
+        // app's own detail screen offers - deliberately NOT a delete
+        // button here too (a request-level decision, not an oversight):
+        // deleting from a full-bleed preview is a much easier accidental
+        // tap than from the long-press menu deleting already lives in.
+        //
+        // Type-conditional (text gets Copy, image/file gets Share), same
+        // split itemActionMenu's long-press menu already uses - Android
+        // shows both unconditionally, but this app's copyItemContent is
+        // deliberately text-only (see its own comment: dumping an image's
+        // raw base64 onto the clipboard as literal text was a real,
+        // already-fixed bug, and offering "Copy" for a file entry would
+        // do the exact same thing with its JSON descriptor instead).
+        if (this.currentDetailItem()?.type === 'text') {
+          Button() {
+            Image($r('app.media.ic_menu_copy')).width(22).height(22)
+          }
+          .type(ButtonType.Circle)
+          .width(40)
+          .height(40)
+          .clipShape(new CircleShape({ width: 40, height: 40 }))
+          .backgroundColor(Color.Transparent)
+          .systemMaterial(this.buttonMaterial())
+          .onClick(() => {
+            tapHaptic();
+            const item = this.currentDetailItem();
+            if (item) this.copyItemContent(item);
+          })
+        } else if (this.currentDetailItem() !== undefined) {
+          Button() {
+            Image($r('app.media.ic_menu_share')).width(22).height(22)
+          }
+          .type(ButtonType.Circle)
+          .width(40)
+          .height(40)
+          .clipShape(new CircleShape({ width: 40, height: 40 }))
+          .backgroundColor(Color.Transparent)
+          .systemMaterial(this.buttonMaterial())
+          .onClick(() => {
+            tapHaptic();
+            const item = this.currentDetailItem();
+            if (item) void this.shareItem(item);
+          })
+        }
+      }
+
       if (trailing === 'viewmode') {
         // The real system segmented control, not a pair of hand-styled
         // Texts pretending to be one. Beyond matching the platform's own
@@ -2429,7 +2496,7 @@ struct Index {
       // margin, which is why it kept landing in a different place from
       // the Me sub-screens' equally hand-tuned one. Both are now the same
       // component in the same slot.
-      .title(this.glassTitleBar('', 'detail', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .title(this.glassTitleBar('', 'detail', 'actions'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
       .hideBackButton(true)
       // System back gesture AND a tap on the native back button both
       // funnel through this same interception point - needed so either
@@ -2741,7 +2808,7 @@ struct Index {
         Button('Trust')
           .fontSize(13)
           .fontColor($r('sys.color.font_on_primary'))
-          .backgroundColor($r('sys.color.brand'))
+          .backgroundColor($r('app.color.brand_blue'))
           .height(34)
           .padding({ left: 16, right: 16 })
           .onClick(() => {
@@ -2853,7 +2920,7 @@ struct Index {
       .type(ButtonType.Circle)
       .width(56)
       .height(56)
-      .backgroundColor($r('sys.color.brand'))
+      .backgroundColor($r('app.color.brand_blue'))
       .onClick(() => { tapHaptic(); setTimeout(() => { this.openPairingFromDevices(); }, 50); })
     }
     .width('100%')
@@ -3121,7 +3188,7 @@ struct Index {
               .borderRadius(16)
           }
           Text('Scan this on another device (with its own Pairing screen open) to find it.').fontSize(12).fontColor($r('sys.color.font_secondary'))
-          Button('Scan a Device\'s QR Code').fontSize(14).fontColor($r('sys.color.brand')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
+          Button('Scan a Device\'s QR Code').fontSize(14).fontColor($r('app.color.brand_blue')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
             .onClick(() => { tapHaptic(); void this.scanToPair(); })
           if (this.scanStatus.length > 0) {
             Text(this.scanStatus).fontSize(12).fontColor($r('sys.color.font_secondary'))
@@ -3150,7 +3217,7 @@ struct Index {
             .onChange((value: string) => { this.pairByAddressInput = value; })
           Button(this.pairingInProgress ? 'Connecting...' : 'Pair by Address')
             .fontSize(14)
-            .fontColor($r('sys.color.brand'))
+            .fontColor($r('app.color.brand_blue'))
             .backgroundColor($r('sys.color.comp_emphasize_secondary'))
             .systemMaterial(this.buttonMaterial())
             .enabled(!this.pairingInProgress)
@@ -3167,7 +3234,7 @@ struct Index {
           Text('Copy this and send it to the other device (e.g. paste it into ITS Pair by Address field above) so it knows where to find this one.')
             .fontSize(12)
             .fontColor($r('sys.color.font_secondary'))
-          Button('Copy Pairing Info').fontSize(14).fontColor($r('sys.color.brand')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
+          Button('Copy Pairing Info').fontSize(14).fontColor($r('app.color.brand_blue')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
             .enabled(this.myPairingPayload.length > 0)
             .onClick(() => { tapHaptic(); void this.copyPairingPayload(); })
         }
@@ -3215,7 +3282,7 @@ struct Index {
               .onChange((value: string) => { this.passphraseInput = value; })
             Button(this.settingPassphrase ? 'Setting...' : 'Set Passcode')
               .fontSize(14)
-              .fontColor($r('sys.color.brand'))
+              .fontColor($r('app.color.brand_blue'))
               .backgroundColor($r('sys.color.comp_emphasize_secondary'))
               .systemMaterial(this.buttonMaterial())
               .enabled(!this.settingPassphrase)
@@ -3264,7 +3331,7 @@ struct Index {
             .onChange((value: string) => { this.tailscaleIp = value; })
           Button(this.savingTailscaleIp ? 'Saving...' : 'Save')
             .fontSize(14)
-            .fontColor($r('sys.color.brand'))
+            .fontColor($r('app.color.brand_blue'))
             .backgroundColor($r('sys.color.comp_emphasize_secondary'))
             .systemMaterial(this.buttonMaterial())
             .enabled(!this.savingTailscaleIp)
@@ -3387,8 +3454,8 @@ struct Index {
       icon = $r('app.media.ic_tab_me_filled');
     }
     return BottomTabBarStyle.of(icon, text)
-      .labelStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_secondary') })
-      .iconStyle({ selectedColor: $r('sys.color.brand'), unselectedColor: $r('sys.color.font_secondary') });
+      .labelStyle({ selectedColor: $r('app.color.brand_blue'), unselectedColor: $r('sys.color.font_secondary') })
+      .iconStyle({ selectedColor: $r('app.color.brand_blue'), unselectedColor: $r('sys.color.font_secondary') });
   }
 
   build() {
@@ -3430,7 +3497,7 @@ struct Index {
           style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
           applyShadow: false,
           interactive: true,
-          lightEffect: { color: $r('sys.color.brand') },
+          lightEffect: { color: $r('app.color.brand_blue') },
           colorInvert: true,
         }),
       })

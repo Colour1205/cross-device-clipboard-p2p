@@ -81,17 +81,17 @@ fun SyncedScreen(
     discovering: Boolean,
     contentPadding: PaddingValues,
     actions: SyncedActions,
+    layout: SyncedLayout,
+    onLayoutChange: (SyncedLayout) -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var layout by remember { mutableStateOf(SyncedLayout.List) }
-
     Box(modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
             SyncedHeader(
                 connectedCount = connectedCount,
                 discovering = discovering,
                 layout = layout,
-                onLayoutChange = { layout = it },
+                onLayoutChange = onLayoutChange,
                 topPadding = contentPadding.calculateTopPadding(),
             )
 

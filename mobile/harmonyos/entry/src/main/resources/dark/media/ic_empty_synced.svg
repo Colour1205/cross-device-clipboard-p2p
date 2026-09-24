@@ -1,17 +1,22 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" fill="none">
   <!-- Accent glow / subtle background disc -->
-  <circle cx="60" cy="64" r="44" fill="#0A59F7" fill-opacity="0.06"/>
-  <!-- Clipboard board -->
-  <rect x="36" y="30" width="48" height="64" rx="8" stroke="#8A8A8A" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-  <!-- Clip top -->
-  <path d="M50 30V24C50 21.7909 51.7909 20 54 20H66C68.2091 20 70 21.7909 70 24V30" stroke="#8A8A8A" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="60" cy="64" r="44" fill="#5468D4" fill-opacity="0.12"/>
+  <!-- Clipboard board - see the light variant's comment for why the clip
+       tab below has to overlap this rect's top edge (a wide overlapping
+       tab, not a thin gap-separated nub) to read as a clipboard instead
+       of a battery. -->
+  <rect x="32" y="36" width="56" height="60" rx="10" stroke="#8A8A8A" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Clip tab - filled with a dark surface tone (not the light variant's
+       near-white) so it reads as a solid overlapping piece against a
+       dark background instead of an odd pale patch. -->
+  <rect x="46" y="26" width="28" height="18" rx="6" fill="#242424" stroke="#8A8A8A" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
   <!-- Empty placeholder dashed slots -->
-  <line x1="48" y1="48" x2="72" y2="48" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.45"/>
-  <line x1="48" y1="60" x2="72" y2="60" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.35"/>
-  <line x1="48" y1="72" x2="64" y2="72" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.25"/>
+  <line x1="44" y1="56" x2="76" y2="56" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.45"/>
+  <line x1="44" y1="68" x2="76" y2="68" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.35"/>
+  <line x1="44" y1="80" x2="64" y2="80" stroke="#8A8A8A" stroke-width="2.5" stroke-linecap="round" stroke-dasharray="4 4" stroke-opacity="0.25"/>
   <!-- Waiting peer signal radar arcs (accent brand blue) -->
-  <path d="M88 44C92 48 94 53 94 60C94 67 92 72 88 76" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round"/>
-  <path d="M96 38C102 44 105 51 105 60C105 69 102 76 96 82" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.4"/>
-  <path d="M32 44C28 48 26 53 26 60C26 67 28 72 32 76" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round"/>
-  <path d="M24 38C18 44 15 51 15 60C15 69 18 76 24 82" stroke="#0A59F7" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.4"/>
+  <path d="M92 44C96 48 98 53 98 60C98 67 96 72 92 76" stroke="#5468D4" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M100 38C106 44 109 51 109 60C109 69 106 76 100 82" stroke="#5468D4" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.4"/>
+  <path d="M28 44C24 48 22 53 22 60C22 67 24 72 28 76" stroke="#5468D4" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M20 38C14 44 11 51 11 60C11 69 14 76 20 82" stroke="#5468D4" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.4"/>
 </svg>

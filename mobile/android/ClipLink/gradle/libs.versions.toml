@@ -13,6 +13,7 @@ activityCompose = "1.9.3"
 composeBomAlpha = "2026.09.00"
 kotlinxCoroutines = "1.9.0"
 zxing = "3.5.3"
+camerax = "1.4.1"
 junit = "4.13.2"
 junitVersion = "1.2.1"
 espressoCore = "3.6.1"
@@ -33,6 +34,16 @@ androidx-compose-material3 = { group = "androidx.compose.material3", name = "mat
 androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxing" }
+
+# CameraX - for the pairing screen's "Scan a Device's Code" QR scanner.
+# camera-view's PreviewView gives a ready-made SurfaceView-backed preview
+# instead of hand-rolling one; the actual decode still goes through
+# zxing-core (already a dependency for QR display) via an ImageAnalysis
+# analyzer, rather than pulling in a whole second barcode-scanning library.
+androidx-camera-core = { group = "androidx.camera", name = "camera-core", version.ref = "camerax" }
+androidx-camera-camera2 = { group = "androidx.camera", name = "camera-camera2", version.ref = "camerax" }
+androidx-camera-lifecycle = { group = "androidx.camera", name = "camera-lifecycle", version.ref = "camerax" }
+androidx-camera-view = { group = "androidx.camera", name = "camera-view", version.ref = "camerax" }
 
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }

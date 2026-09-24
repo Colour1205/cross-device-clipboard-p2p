@@ -46,6 +46,7 @@ fun PairScreen(
     contentPadding: PaddingValues,
     onBack: () -> Unit,
     onPair: (String) -> Unit,
+    onScan: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var typed by remember { mutableStateOf("") }
@@ -91,6 +92,14 @@ fun PairScreen(
 
         Spacer(Modifier.height(24.dp))
         QrPanel(payload)
+
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = onScan,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Scan a Device's Code")
+        }
 
         Spacer(Modifier.height(24.dp))
         Text(

@@ -356,6 +356,7 @@ class Program
         FileStore fileStore,
         FileTransferState fileTransferState)
     {
+        connectionsByDeviceId.TryGetValue(conn.PeerDeviceId, out var previous);
         connectionsByDeviceId[conn.PeerDeviceId] = conn;
         Console.WriteLine($"[conn] connected: {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}... ({connectionsByDeviceId.Count} total)");
         SendHistoryBatch(conn, historyAccess);
@@ -383,6 +384,30 @@ class Program
             }
         };
         _ = conn.Listen();
+        if (previous != null && previous != conn)
+        {
+            // A second connection to this same peer just replaced the first
+            // one in the map (duplicate connections happen when a
+            // beacon-triggered dial races one already in flight - see the
+            // connectingTo guard added around the discovery handler and the
+            // off-LAN reconnect loop below). Without this, `previous` was
+            // left alive as an orphan: its own Listen() loop and heartbeat
+            // timer kept running even though nothing sent on it anymore,
+            // and this device's own map already points at the new
+            // connection - but the peer on the other end of that orphaned
+            // socket has no idea it's been superseded, and may still
+            // consider IT the canonical connection. That split-brain (each
+            // side treating a different one of the duplicate sockets as
+            // "the" connection) is what actually produced "Devices tab
+            // shows not connected, but sync still works" on the HarmonyOS
+            // side (the orphan was still relaying data) and connections
+            // appearing to drop later (whichever side's orphan eventually
+            // noticed the other end had stopped using it). Closing it here
+            // immediately - instead of waiting for its own heartbeat to
+            // eventually notice - means there is only ever one live socket
+            // per peer, on both ends.
+            previous.Close();
+        }
     }
 
     // Single funnel for every freshly-created PeerConnection, whichever of
@@ -550,6 +575,19 @@ class Program
         string? ownTailscaleAddress = TailscaleHelper.GetOwnTailscaleIp();
 
         ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId = new ConcurrentDictionary<string, PeerConnection>();
+        // In-flight dial reservations, keyed by the peer's device id. Unlike
+        // connectionsByDeviceId (only populated once a handshake fully
+        // completes), this covers the gap WHILE a dial is happening -
+        // without it, nothing stopped the beacon handler below and the
+        // off-LAN reconnect loop from both dialing the same peer at once
+        // (or the beacon handler dialing it again on the next beacon before
+        // the previous attempt's handshake finished - easily provoked over
+        // a higher-latency link like Tailscale, where a handshake round
+        // trip can outlast the ~2s beacon interval). TryAdd/TryRemove are
+        // atomic, so this is safe even though it's read from two different
+        // async flows. See RegisterConnection's orphan-closing fix for what
+        // a resulting duplicate connection actually causes.
+        ConcurrentDictionary<string, byte> connectingTo = new ConcurrentDictionary<string, byte>();
 
         // local IPC for the tray app (QR pairing, passcode setup, etc.)
         var ipcServer = new IpcServer(label);
@@ -800,7 +838,7 @@ class Program
             // connect only when the other device's public key is "smaller" than this device's public key (to avoid duplicate connections)
             // connect only if the other device is in the trust store
             if (!connectionsByDeviceId.ContainsKey(other_device_id) && other_device_id.CompareTo(identity.GetPublicKey()) < 0
-            && isTrusted)
+            && isTrusted && connectingTo.TryAdd(other_device_id, 0))
             {
                 Console.WriteLine($"Discovered peer {other_device_id} at {other_port}");
                 try
@@ -810,6 +848,10 @@ class Program
                 catch (Exception)
                 {
                     // peer wasn't actually reachable — ignore, we'll hear its next beacon
+                }
+                finally
+                {
+                    connectingTo.TryRemove(other_device_id, out _);
                 }
             }
             // Sibling path for UNTRUSTED peers - only attempts a handshake at
@@ -839,7 +881,8 @@ class Program
             {
                 var attempts = trustStore.GetTrustedDevicesWithAddress()
                     .Where(device => !connectionsByDeviceId.ContainsKey(device.PublicKey)
-                        && device.PublicKey.CompareTo(identity.GetPublicKey()) < 0)
+                        && device.PublicKey.CompareTo(identity.GetPublicKey()) < 0
+                        && connectingTo.TryAdd(device.PublicKey, 0))
                     .Select(async device =>
                     {
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -850,6 +893,10 @@ class Program
                         catch (Exception)
                         {
                             // not reachable via this address right now — retry next cycle
+                        }
+                        finally
+                        {
+                            connectingTo.TryRemove(device.PublicKey, out _);
                         }
                     });
 
