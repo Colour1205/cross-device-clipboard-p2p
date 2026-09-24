@@ -200,6 +200,10 @@ const GLOW_HEIGHT_ABOVE_INSET: number = 460;
 const GLOW_OPACITY: number = 0.13;
 const GLOW_STOPS: number = 8;
 
+// Strength of Index's accentTint(), the fill of tinted secondary buttons -
+// the same 20% as the sys.color.comp_emphasize_secondary it replaces.
+const ACCENT_TINT_ALPHA: number = 0.2;
+
 const IMAGE_FILE_EXTENSIONS: string[] = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.heif'];
 
 // A 'file' entry is just "bytes with a name" at the wire level - whether it
@@ -1910,13 +1914,32 @@ struct Index {
   // the finger) are the tactile feedback replacing the plain default press
   // state - lightEffect.color is the one app accent color, reused here and
   // everywhere else it applies, rather than defaulting to white.
+  //
+  // Per the systemMaterial reference, a Button's material only renders in
+  // a Navigation/NavDestination title bar or a bottom TabBar - in page
+  // content (every current caller) it's inactive and the Button's
+  // backgroundColor is what shows. So those buttons set
+  // backgroundColor(accentTint()) BEFORE .systemMaterial() (set after, it
+  // would stack on top of an active material); materialColor carries the
+  // same tint for wherever the material does render.
   private buttonMaterial(): uiMaterial.ImmersiveMaterial {
     return new uiMaterial.ImmersiveMaterial({
       style: uiMaterial.ImmersiveStyle.THIN,
+      materialColor: this.accentTint(),
       interactive: true,
       colorInvert: true,
       lightEffect: { color: this.accent() },
     });
+  }
+
+  // The accent as a translucent fill for tinted secondary buttons - the
+  // theme's stand-in for sys.color.comp_emphasize_secondary ("20% brand
+  // background", i.e. the system blue at alpha 0x33), which is what these
+  // buttons used before and why they stayed blue under every theme.
+  // Translucent also because a material's materialColor must not be
+  // opaque (it would hide the material entirely).
+  private accentTint(): ResourceColor {
+    return this.colorWithAlpha(themeFor(this.accentTheme).color, ACCENT_TINT_ALPHA);
   }
 
   // The long-press menu's own material - THICK is the documented default
@@ -1978,7 +2001,14 @@ struct Index {
     const key: string = `${this.colorMode}:${res.id}`;
     let argb: number | undefined = this.resolvedColors.get(key);
     if (argb === undefined) {
-      argb = getContext(this).resourceManager.getColorSync(res.id);
+      try {
+        argb = getContext(this).resourceManager.getColorSync(res.id);
+      } catch (e) {
+        // This runs mid-render, where a throw would take the page down -
+        // a mid grey is a visible but harmless stand-in. Not cached, so
+        // the next render tries again.
+        return 0xFF808080;
+      }
       this.resolvedColors.set(key, argb);
     }
     return argb;
@@ -2062,7 +2092,10 @@ struct Index {
         if (item.type === 'image') {
           MenuItem({ content: 'Save to gallery', startIcon: $r('app.media.ic_menu_save_gallery') }).onClick(() => { tapHaptic(); this.showSaveImageDialog(item); })
         } else {
-          MenuItem({ content: 'Open', startIcon: $r('app.media.ic_menu_save_file') }).onClick(() => { tapHaptic(); void this.openFileWithSystem(item); })
+          // Same shape as the preview title bar's Open button
+          // (sys.symbol.arrow_right_up_and_square), drawn in this menu's
+          // stroke style.
+          MenuItem({ content: 'Open', startIcon: $r('app.media.ic_menu_open') }).onClick(() => { tapHaptic(); void this.openFileWithSystem(item); })
           MenuItem({ content: 'Save file', startIcon: $r('app.media.ic_menu_save_file') }).onClick(() => { tapHaptic(); void this.saveFileToDocuments(item); })
         }
       }
@@ -2647,12 +2680,14 @@ struct Index {
     }]);
   }
 
-  // Item preview: Copy for text, Share for images/files - the same split
-  // itemActionMenu's long-press menu uses. copyItemContent is deliberately
-  // text-only (copying an image's raw base64, or a file's JSON descriptor,
-  // as literal text was a real, already-fixed bug). No Delete here by
-  // request: it's a much easier accidental tap from a full-bleed preview
-  // than from the long-press menu it already lives in.
+  // Item preview: Copy for text, Share for images/files, and Open (left of
+  // Share) for files - the same split itemActionMenu's long-press menu
+  // uses. Open is files-only because openFileWithSystem hands the system a
+  // stored file; an 'image' item is only base64 in memory. copyItemContent
+  // is deliberately text-only (copying an image's raw base64, or a file's
+  // JSON descriptor, as literal text was a real, already-fixed bug). No
+  // Delete here by request: it's a much easier accidental tap from a
+  // full-bleed preview than from the long-press menu it already lives in.
   private detailTitleBar(itemId: string): HdsNavigationTitleBarOptions {
     const item: SyncedItem | undefined = this.syncedItems.find(i => i.id === itemId);
     if (item === undefined) return this.hdsTitleBar('', false, []);
@@ -2665,13 +2700,23 @@ struct Index {
         },
       }]);
     }
-    return this.hdsTitleBar('', false, [{
+    const share: HdsNavigationMenuItemOptions = {
       content: {
         label: 'Share',
         icon: $r('sys.symbol.share'),
         action: () => { tapHaptic(); void this.shareItem(item); },
       },
-    }]);
+    };
+    if (item.type === 'file') {
+      return this.hdsTitleBar('', false, [{
+        content: {
+          label: 'Open',
+          icon: $r('sys.symbol.arrow_right_up_and_square'),
+          action: () => { tapHaptic(); void this.openFileWithSystem(item); },
+        },
+      }, share]);
+    }
+    return this.hdsTitleBar('', false, [share]);
   }
 
   // Wraps the list and the item-detail view as two NavDestinations on their
@@ -3663,7 +3708,7 @@ struct Index {
               .borderRadius(16)
           }
           Text('Scan this on another device (with its own Pairing screen open) to find it.').fontSize(12).fontColor($r('sys.color.font_secondary'))
-          Button('Scan a Device\'s QR Code').fontSize(14).fontColor(this.accent()).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
+          Button('Scan a Device\'s QR Code').fontSize(14).fontColor(this.accent()).backgroundColor(this.accentTint()).systemMaterial(this.buttonMaterial())
             .onClick(() => { tapHaptic(); void this.scanToPair(); })
           if (this.scanStatus.length > 0) {
             Text(this.scanStatus).fontSize(12).fontColor($r('sys.color.font_secondary'))
@@ -3693,7 +3738,7 @@ struct Index {
           Button(this.pairingInProgress ? 'Connecting...' : 'Pair by Address')
             .fontSize(14)
             .fontColor(this.accent())
-            .backgroundColor($r('sys.color.comp_emphasize_secondary'))
+            .backgroundColor(this.accentTint())
             .systemMaterial(this.buttonMaterial())
             .enabled(!this.pairingInProgress)
             .onClick(() => { tapHaptic(); void this.pairByAddress(); })
@@ -3709,7 +3754,7 @@ struct Index {
           Text('Copy this and send it to the other device (e.g. paste it into ITS Pair by Address field above) so it knows where to find this one.')
             .fontSize(12)
             .fontColor($r('sys.color.font_secondary'))
-          Button('Copy Pairing Info').fontSize(14).fontColor(this.accent()).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
+          Button('Copy Pairing Info').fontSize(14).fontColor(this.accent()).backgroundColor(this.accentTint()).systemMaterial(this.buttonMaterial())
             .enabled(this.myPairingPayload.length > 0)
             .onClick(() => { tapHaptic(); void this.copyPairingPayload(); })
         }
@@ -3756,7 +3801,7 @@ struct Index {
               Button('Change Passcode')
                 .fontSize(14)
                 .fontColor(this.accent())
-                .backgroundColor($r('sys.color.comp_emphasize_secondary'))
+                .backgroundColor(this.accentTint())
                 .systemMaterial(this.buttonMaterial())
                 .onClick(() => { tapHaptic(); this.passphraseInput = ''; this.passcodeChanging = true; })
               Button('Clear')
@@ -3775,7 +3820,7 @@ struct Index {
               Button(this.settingPassphrase ? 'Setting...' : 'Set Passcode')
                 .fontSize(14)
                 .fontColor(this.accent())
-                .backgroundColor($r('sys.color.comp_emphasize_secondary'))
+                .backgroundColor(this.accentTint())
                 .systemMaterial(this.buttonMaterial())
                 .enabled(!this.settingPassphrase)
                 .onClick(() => { tapHaptic(); void this.setPassphrase(); })
@@ -3833,7 +3878,7 @@ struct Index {
           Button(this.savingTailscaleIp ? 'Saving...' : 'Save')
             .fontSize(14)
             .fontColor(this.accent())
-            .backgroundColor($r('sys.color.comp_emphasize_secondary'))
+            .backgroundColor(this.accentTint())
             .systemMaterial(this.buttonMaterial())
             .enabled(!this.savingTailscaleIp)
             .onClick(() => { tapHaptic(); void this.saveTailscaleIp(); })
