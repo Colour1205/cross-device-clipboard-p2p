@@ -8,6 +8,7 @@
 // signature or deriving a session key for a peer we'd refuse anyway).
 
 import socket from '@ohos.net.socket';
+import hilog from '@ohos.hilog';
 import { cryptoFramework } from '@kit.CryptoArchitectureKit';
 import { util } from '@kit.ArkTS';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -353,6 +354,7 @@ export class PeerConnection {
   }
 
   private async listenLoop(): Promise<void> {
+    let failed = false;
     try {
       while (true) {
         const line = await this.channel.readLine();
@@ -364,7 +366,13 @@ export class PeerConnection {
       }
     } catch (e) {
       // abrupt disconnect, or a corrupt/forged line that failed to decrypt
+      failed = true;
     } finally {
+      // idleMs over HEARTBEAT_TIMEOUT_MS means this side's own watchdog
+      // closed the link; a small idleMs means the peer (or a superseding
+      // connection, see SyncManager.registerConnection) closed it.
+      hilog.info(0x0001, 'ClipLinkNet', '%{public}s',
+        `conn closed: peer=${this.peerDeviceId.slice(0, 16)}... idleMs=${Date.now() - this.lastActivityAt} failed=${failed}`);
       this.stopHeartbeat();
       this.disconnectedCallback?.();
     }

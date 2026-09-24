@@ -492,10 +492,24 @@ class Program
         }
         if (conn.PeerDeviceId != peerDeviceId)
         {
-            // connected, but whoever answered isn't who we meant to reach —
-            // refuse rather than silently trusting data from the wrong device
-            conn.Close();
-            throw new IOException("Connected peer's identity did not match the expected device id");
+            // The address we had for peerDeviceId now belongs to a different
+            // device - typically the same phone after a reinstall gave it a
+            // new identity but kept its IP, leaving the old identity in the
+            // trust store with that address. This used to close the
+            // connection, but the other end had already completed the same
+            // handshake and registered it, so every 30s this off-LAN loop
+            // knocked out the phone's live connection (its map entry was
+            // evicted while the real link kept syncing - "Devices shows not
+            // connected but sync works"), or with the newer replace-on-
+            // register logic, dropped the live link outright.
+            //
+            // Trust is decided by CreateAsync for the identity that actually
+            // answered, so it's safe to treat this as a connection to THAT
+            // device. The stale entry keeps its trust but loses the address,
+            // so it's never dialled here again (it's re-learned if that
+            // device really does come back).
+            Console.WriteLine($"[conn] {address} answered as {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}..., not {peerDeviceId[..Math.Min(12, peerDeviceId.Length)]}... - clearing that stale address");
+            trustStore.Trust(peerDeviceId, null);
         }
 
         HandleNewConnection(conn, address, pairingState, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);

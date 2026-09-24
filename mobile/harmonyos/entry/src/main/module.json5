@@ -37,6 +37,11 @@
         // no runtime user dialog. Needed for the long-press menu's
         // hapticFeedbackMode - see syncedItemCard's bindContextMenu.
         "name": "ohos.permission.VIBRATE"
+      },
+      {
+        // Normal/system_grant. Lets the Me screen list this device's own
+        // IP addresses (connection.getConnectionPropertiesSync).
+        "name": "ohos.permission.GET_NETWORK_INFO"
       }
     ],
     "abilities": [

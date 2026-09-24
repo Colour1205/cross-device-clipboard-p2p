@@ -22,7 +22,9 @@ import { FilePayload } from '../storage/FilePayload';
 
 const base64Helper = new util.Base64Helper();
 
-export type ApplyResult = 'applied' | 'unsupported-type' | 'error';
+// 'skipped': the user turned off "Copy received items automatically", so the
+// entry was recorded but deliberately not written to the pasteboard.
+export type ApplyResult = 'applied' | 'unsupported-type' | 'error' | 'skipped';
 
 export async function applyEntryToClipboard(entry: ClipboardEntry, fileStore?: FileStore): Promise<ApplyResult> {
   try {

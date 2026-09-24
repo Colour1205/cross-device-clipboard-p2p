@@ -72,6 +72,10 @@ export class SyncManager {
   // and the two chunk sequences interleave on the wire - which is what
   // "file transfer failed hash verification" actually was.
   private streamingInFlight: Set<string> = new Set();
+  // "Copy received items automatically" (DeviceSettings.getAutoApply). Off,
+  // a received entry is still verified, recorded and reported to the UI -
+  // only the write to the system pasteboard is skipped.
+  private autoApply: boolean = true;
 
   constructor(fileStore: FileStore, trustStore: TrustStore, context: common.UIAbilityContext) {
     this.history = new HistoryAccess(fileStore);
@@ -96,6 +100,23 @@ export class SyncManager {
   // (peer disconnect).
   onConnectionsChanged(callback: (count: number) => void): void {
     this.connectionsChangedCallback = callback;
+  }
+
+  setAutoApply(value: boolean): void {
+    this.autoApply = value;
+  }
+
+  // pendingEntries is cleared too: otherwise a file whose bytes finish
+  // arriving after this would still fire entryAppliedCallback and the
+  // cleared item would pop back into the list. A peer's history_batch on
+  // its next reconnect can still re-add entries it has, same as Android.
+  getHistory(): Promise<ClipboardEntry[]> {
+    return this.history.getHistory(this.context);
+  }
+
+  async clearHistory(): Promise<void> {
+    this.pendingEntries.clear();
+    await this.history.clearHistory(this.context);
   }
 
   get connectionCount(): number {
@@ -197,7 +218,7 @@ export class SyncManager {
       this.handleIncomingFileEntry(entry);
       return;
     }
-    const result = await applyEntryToClipboard(entry, this.fileStore);
+    const result: ApplyResult = this.autoApply ? await applyEntryToClipboard(entry, this.fileStore) : 'skipped';
     this.entryAppliedCallback?.(entry, result, true);
   }
 
@@ -223,8 +244,10 @@ export class SyncManager {
     this.broadcastFileRequest(payload.FileHash);
   }
 
+  // Bytes are still fetched and cached when autoApply is off (handleIncomingFileEntry
+  // requests them regardless), so Share/Save work on the item later.
   private async applyFileEntry(entry: ClipboardEntry): Promise<void> {
-    const result = await applyEntryToClipboard(entry, this.fileStore);
+    const result: ApplyResult = this.autoApply ? await applyEntryToClipboard(entry, this.fileStore) : 'skipped';
     this.entryAppliedCallback?.(entry, result, true);
   }
 

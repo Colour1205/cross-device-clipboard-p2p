@@ -69,7 +69,50 @@ export class ClipboardWatcher {
   private lastKnownHash: string | null = null;
   private listening = false;
   private changedCallback: (() => void) | null = null;
-  private boundHandler = () => { this.changedCallback?.(); };
+  // The pasteboard's change counter (getChangeCount, API 18+, no permission)
+  // as of the last time this app itself wrote to or read the clipboard.
+  // -1 until first recorded, so whatever is on the clipboard when the app
+  // first opens counts as new - that's the "copied elsewhere, then opened
+  // ClipLink" case this exists for.
+  private lastSeenCount: number = -1;
+  // Filters out 'update' events caused by this app's own writes (applying a
+  // received item, Copy, Copy pairing info...), which previously flagged
+  // ClipLink's own clipboard writes as something new to send.
+  private boundHandler = () => {
+    if (this.hasUnseenChange()) this.changedCallback?.();
+  };
+
+  // Call right after this app writes to the clipboard, and after a
+  // PasteButton read, so the change it caused isn't reported back as new.
+  // Returns the recorded count (-1 if unavailable) so the caller can persist
+  // it - otherwise a restart forgets it and ClipLink's own last write shows
+  // up as "New copy".
+  markSeen(): number {
+    try {
+      this.lastSeenCount = pasteboard.getSystemPasteboard().getChangeCount();
+    } catch (e) {
+      // counter unavailable - leave the previous value
+    }
+    return this.lastSeenCount;
+  }
+
+  // The counter persists until reboot or a pasteboard service restart; after
+  // either it restarts from 0, won't match, and the content counts as new.
+  restoreSeen(count: number): void {
+    this.lastSeenCount = count;
+  }
+
+  // Whether something was copied since markSeen, without reading it (that
+  // still needs a PasteButton tap). The counter also bumps when identical
+  // data is copied again, and resets on reboot.
+  hasUnseenChange(): boolean {
+    try {
+      const pb = pasteboard.getSystemPasteboard();
+      return pb.getChangeCount() !== this.lastSeenCount && pb.hasDataSync();
+    } catch (e) {
+      return false;
+    }
+  }
 
   // Fires on every pasteboard 'update' — free, no permission needed. Use
   // this only to prompt the user to tap the PasteButton; do not call

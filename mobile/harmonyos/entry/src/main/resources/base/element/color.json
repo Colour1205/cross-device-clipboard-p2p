@@ -7,6 +7,30 @@
     {
       "name": "brand_blue",
       "value": "#5468D4"
+    },
+    {
+      "name": "card_surface",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "theme_teal",
+      "value": "#1E8C84"
+    },
+    {
+      "name": "theme_green",
+      "value": "#3D8F5A"
+    },
+    {
+      "name": "theme_orange",
+      "value": "#D9692F"
+    },
+    {
+      "name": "theme_rose",
+      "value": "#C24D7C"
+    },
+    {
+      "name": "theme_violet",
+      "value": "#7B55C7"
     }
   ]
 }

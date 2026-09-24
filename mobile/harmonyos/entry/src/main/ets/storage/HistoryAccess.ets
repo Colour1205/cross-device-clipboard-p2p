@@ -17,9 +17,20 @@ const MAX_HISTORY_ITEMS = 25;
 
 export class HistoryAccess {
   private fileStore: FileStore;
+  // Every read-modify-write of the history runs one at a time. Each yields
+  // at getPreferences/flush, so an add that read the old list before a
+  // clear wrote [] could write it back afterwards - resurrecting cleared
+  // entries whose file blobs had already been deleted.
+  private chain: Promise<void> = Promise.resolve();
 
   constructor(fileStore: FileStore) {
     this.fileStore = fileStore;
+  }
+
+  private serialized<T>(work: () => Promise<T>): Promise<T> {
+    const result: Promise<T> = this.chain.then(work);
+    this.chain = result.then(() => {}, () => {});
+    return result;
   }
 
   private async getPrefs(context: common.UIAbilityContext): Promise<preferences.Preferences> {
@@ -52,15 +63,17 @@ export class HistoryAccess {
   // Returns true only if the entry was genuinely new (not a duplicate) -
   // matches HistoryAccess.cs's addToHistory return contract, which callers
   // rely on to decide whether to also apply/re-broadcast an entry.
-  async addToHistory(context: common.UIAbilityContext, entry: ClipboardEntry): Promise<boolean> {
-    const entries = await this.getHistory(context);
-    if (entries.some(e => this.isSameEntry(e, entry))) {
-      return false;
-    }
-    entries.push(entry);
-    await this.trimToLimit(entries);
-    await this.saveHistory(context, entries);
-    return true;
+  addToHistory(context: common.UIAbilityContext, entry: ClipboardEntry): Promise<boolean> {
+    return this.serialized(async (): Promise<boolean> => {
+      const entries = await this.getHistory(context);
+      if (entries.some(e => this.isSameEntry(e, entry))) {
+        return false;
+      }
+      entries.push(entry);
+      await this.trimToLimit(entries);
+      await this.saveHistory(context, entries);
+      return true;
+    });
   }
 
   // Oldest-first eviction once over the cap - also deletes the backing
@@ -74,18 +87,30 @@ export class HistoryAccess {
         }
       }
       const oldest = entries.splice(oldestIndex, 1)[0];
-      if (oldest.Type === 'file') {
-        try {
-          const payload = JSON.parse(oldest.Content) as FilePayload;
-          this.fileStore.delete(payload.FileHash);
-        } catch (e) {
-          // malformed descriptor — nothing coherent to clean up
-        }
-      }
+      this.releaseBlob(oldest);
     }
   }
 
-  async clearHistory(context: common.UIAbilityContext): Promise<void> {
-    await this.saveHistory(context, []);
+  private releaseBlob(entry: ClipboardEntry): void {
+    if (entry.Type !== 'file') return;
+    try {
+      const payload = JSON.parse(entry.Content) as FilePayload;
+      this.fileStore.delete(payload.FileHash);
+    } catch (e) {
+      // malformed descriptor — nothing coherent to clean up
+    }
+  }
+
+  // Deletes only the blobs the cleared entries referenced, like Android's
+  // HistoryStore.clear - not the whole files directory, which can hold a
+  // half-written .tmp an in-progress transfer still has open.
+  clearHistory(context: common.UIAbilityContext): Promise<void> {
+    return this.serialized(async (): Promise<void> => {
+      const entries = await this.getHistory(context);
+      for (const entry of entries) {
+        this.releaseBlob(entry);
+      }
+      await this.saveHistory(context, []);
+    });
   }
 }

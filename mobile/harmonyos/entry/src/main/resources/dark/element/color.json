@@ -3,6 +3,30 @@
     {
       "name": "start_window_background",
       "value": "#000000"
+    },
+    {
+      "name": "card_surface",
+      "value": "#191919"
+    },
+    {
+      "name": "theme_teal",
+      "value": "#4DB6AC"
+    },
+    {
+      "name": "theme_green",
+      "value": "#66BB80"
+    },
+    {
+      "name": "theme_orange",
+      "value": "#F0935E"
+    },
+    {
+      "name": "theme_rose",
+      "value": "#E07BA3"
+    },
+    {
+      "name": "theme_violet",
+      "value": "#A084E0"
     }
   ]
 }

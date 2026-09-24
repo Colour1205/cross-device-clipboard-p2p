@@ -72,6 +72,14 @@ export class PassphraseKeyStore {
     await prefs.flush();
   }
 
+  // Devices already auto-trusted via the passcode stay trusted - this only
+  // stops this device proving the passcode to new ones (same as Android).
+  async clearPassphrase(context: common.UIAbilityContext): Promise<void> {
+    const prefs = await this.getPrefs(context);
+    prefs.deleteSync(KEY_KEY);
+    await prefs.flush();
+  }
+
   async getKey(context: common.UIAbilityContext): Promise<Uint8Array | null> {
     const prefs = await this.getPrefs(context);
     if (!prefs.hasSync(KEY_KEY)) return null;

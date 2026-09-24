@@ -16,8 +16,9 @@
 import hilog from '@ohos.hilog';
 import { common, Want, wantConstant } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { window, promptAction, curves, CircleShape, SegmentButton, SegmentButtonOptions,
-  ItemRestriction, SegmentButtonTextItem, LengthMetrics } from '@kit.ArkUI';
+import { window, promptAction, curves, LengthMetrics } from '@kit.ArkUI';
+import { HdsNavigation, HdsNavDestination, HdsNavDestinationTitleMode, HdsNavigationTitleBarOptions,
+  HdsNavigationMenuItemOptions, ScrollEffectType, TitleSize, hdsMaterial } from '@kit.UIDesignKit';
 import { scanBarcode } from '@kit.ScanKit';
 import { systemShare } from '@kit.ShareKit';
 import { filePreview } from '@kit.PreviewKit';
@@ -42,6 +43,7 @@ import { Discovery, PeerBeacon } from '../networking/Discovery';
 import { TcpServer, connectTcp } from '../networking/TcpTransport';
 import { PeerConnection, TcpSocketAdapter, TcpSocketConnectionAdapter } from '../networking/PeerConnection';
 import { SyncManager } from '../networking/SyncManager';
+import { connection } from '@kit.NetworkKit';
 import { signEntry, ClipboardEntry } from '../crypto/Signing';
 import { ApplyResult } from '../clipboard/ClipboardApply';
 import socket from '@ohos.net.socket';
@@ -141,6 +143,62 @@ interface PairingInfo {
   PublicKey: string;
   Address?: string;
 }
+
+// Passed to settingsSwitchRow as its ONLY argument, deliberately: ArkUI
+// passes a @Builder's single object-literal parameter by reference, so a
+// state variable read into `isOn` at the call site still refreshes the row.
+// With several positional parameters they're passed by value and the
+// switch would keep showing whatever it first rendered with.
+interface SwitchRowOptions {
+  title: string;
+  subtitle: string;
+  isOn: boolean;
+  icon: Resource;
+  onChange: (isOn: boolean) => void;
+  enabled?: boolean;
+}
+
+// settingsRow's single argument - same by-reference reasoning as
+// SwitchRowOptions.
+interface SettingsRowOptions {
+  title: string;
+  value: string;
+  navigates: boolean;
+  icon: Resource;
+  onTap: () => void;
+}
+
+// One accent colour theme. Each colour resource has its own dark-mode shade
+// in resources/dark/element/color.json (except navy, which is the original
+// single-value brand_blue).
+interface ThemeOption {
+  key: string;
+  name: string;
+  color: Resource;
+}
+
+const THEMES: ThemeOption[] = [
+  { key: 'navy', name: 'Navy', color: $r('app.color.brand_blue') },
+  { key: 'teal', name: 'Teal', color: $r('app.color.theme_teal') },
+  { key: 'green', name: 'Green', color: $r('app.color.theme_green') },
+  { key: 'orange', name: 'Orange', color: $r('app.color.theme_orange') },
+  { key: 'rose', name: 'Rose', color: $r('app.color.theme_rose') },
+  { key: 'violet', name: 'Violet', color: $r('app.color.theme_violet') },
+];
+
+// Falls back to navy for an unset or no-longer-known stored key.
+function themeFor(key: string): ThemeOption {
+  const found: ThemeOption | undefined = THEMES.find((t: ThemeOption) => t.key === key);
+  return found !== undefined ? found : THEMES[0];
+}
+
+// How far above bottomInsetVp the bottom glow reaches (about half the
+// screen), how strong it is at the bottom edge, and how many colour stops
+// trace its eased falloff (see Index's bottomGlow). Tall and faint, so it
+// reads as a wash rather than a band.
+const GLOW_HEIGHT_ABOVE_INSET: number = 460;
+const GLOW_OPACITY: number = 0.13;
+const GLOW_STOPS: number = 8;
 
 const IMAGE_FILE_EXTENSIONS: string[] = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.heif'];
 
@@ -259,6 +317,13 @@ struct Index {
   @State connectedCount: number = 0;
   @State topInsetVp: number = 0;
   @State bottomInsetVp: number = 0;
+  // Window height, for placing the bottom glow's colour stops (see
+  // bottomGlow) - a gradient's stops are fractions of the page's height.
+  @State windowHeightVp: number = 0;
+  // Light/dark, kept in AppStorage by EntryAbility. Colours that get an
+  // alpha applied in code (see colorWithAlpha) are resolved from their
+  // resources per mode, so they must re-resolve when this flips.
+  @StorageProp('colorMode') colorMode: number = -1;
   @State currentTabIndex: number = 0;
   @State myPairingPayload: string = '';
   @State hasPassphrase: boolean = false;
@@ -267,6 +332,23 @@ struct Index {
   // for why this can't be auto-detected on HarmonyOS the way Windows does.
   @State tailscaleIp: string = '';
   @State savingTailscaleIp: boolean = false;
+  // Mirror of DeviceSettings.getAutoApply, pushed into SyncManager too.
+  @State autoApply: boolean = true;
+  // DeviceSettings.getNoticeNewCopies - see onPageShow.
+  @State noticeOnOpen: boolean = true;
+  // DeviceSettings.getAccentThemeSync - a key from THEMES, see accent().
+  @State accentTheme: string = '';
+  // Appearance: the bottom glow (see bottomGlow) and how see-through card
+  // surfaces are, 0-100% (see cardFill).
+  @State bottomGlowOn: boolean = true;
+  @State cardTransparency: number = 0;
+  private readonly themes: ThemeOption[] = THEMES;
+  // Resolved ARGB per `${colorMode}:${resource id}` - see resolveColor.
+  private resolvedColors: Map<string, number> = new Map();
+  // This device's own IPv4 addresses, for the Device card (Android shows the
+  // same list).
+  @State localAddresses: string[] = [];
+  @State passcodeChanging: boolean = false;
   @State settingPassphrase: boolean = false;
   @State scanStatus: string = '';
   // Which synced item (by id) is open in the full-screen detail view - a tap
@@ -276,33 +358,9 @@ struct Index {
   // meaningful full-screen preview for them) - tapping one just plays the
   // shared clickEffect() feedback every card gets, per request.
   @State selectedItemId: string = '';
-  // List vs 2-column WaterFlow grid for the Synced tab - see syncedTab's
-  // viewModeToggleButton.
+  // List vs 2-column WaterFlow grid for the Synced tab - toggled by the
+  // title bar's menu icon (see syncedTitleBar).
   @State syncedViewMode: string = 'waterfall';
-  // Backing state for the List/Grid SegmentButton. SegmentButton takes its
-  // options via @ObjectLink and its selection via @Link, so both have to
-  // live as real state on this component rather than being built inline in
-  // the builder. Index 0 = List, 1 = Grid; syncedViewMode stays the single
-  // source of truth for which view actually renders, and onSelectedChange
-  // keeps the two in step.
-  @State viewModeOptions: SegmentButtonOptions = SegmentButtonOptions.tab({
-    buttons: [{ text: 'List' }, { text: 'Grid' }] as ItemRestriction<SegmentButtonTextItem>,
-    // Every colour set explicitly from tokens. Left to its defaults, the
-    // selected item rendered near-white text on a mid-grey thumb in dark
-    // mode - the label colour did not invert with the theme the way the
-    // thumb did, so the selected option was the least readable thing in
-    // the bar. font_primary/font_secondary and the comp_background_*
-    // surfaces all re-resolve per theme, so the pairing holds in both.
-    fontColor: $r('sys.color.font_secondary'),
-    selectedFontColor: $r('sys.color.font_primary'),
-    backgroundColor: $r('sys.color.comp_background_tertiary'),
-    selectedBackgroundColor: $r('sys.color.comp_background_primary'),
-    backgroundSystemMaterial: new uiMaterial.ImmersiveMaterial({
-      style: uiMaterial.ImmersiveStyle.THIN,
-      colorInvert: true,
-    }),
-  });
-  @State viewModeSelection: number[] = [1];
   // Two-finger pinch zoom on the item detail image - imageZoomScale is what
   // Image.scale() actually reads; imageZoomBase is the scale it was at when
   // the current pinch gesture started, since GestureEvent.scale is relative
@@ -343,6 +401,15 @@ struct Index {
   private trustStore: TrustStore = new TrustStore();
   private passphraseKeyStore: PassphraseKeyStore = new PassphraseKeyStore();
   private deviceSettings: DeviceSettings = new DeviceSettings();
+  private mainWindow: window.Window | null = null;
+  private onAvoidAreaChange = (data: window.AvoidAreaOptions): void => {
+    if (data.type !== window.AvoidAreaType.TYPE_SYSTEM) return;
+    this.topInsetVp = px2vp(data.area.topRect.height);
+    this.bottomInsetVp = px2vp(data.area.bottomRect.height);
+  };
+  private onWindowSizeChange = (size: window.Size): void => {
+    this.windowHeightVp = px2vp(size.height);
+  };
   private syncManager: SyncManager | null = null;
   private fileStore: FileStore | null = null;
   private connectingTo: Set<string> = new Set();
@@ -367,6 +434,21 @@ struct Index {
   // never scroll behind anything and its header had no material. It gets
   // the same stack/destination treatment as the other two now.
   private devicesNavStack: NavPathStack = new NavPathStack();
+  // One Scroller per scrollable that sits under an HDS title bar, handed to
+  // that page's bindToScrollable. The gradient blur is driven by the bound
+  // scroller's offset, so it must be the exact instance the List/Scroll/
+  // WaterFlow was constructed with - a fresh Scroller would leave the bar
+  // with nothing to react to and the blur would never fade in.
+  private syncedListScroller: Scroller = new Scroller();
+  private syncedFlowScroller: Scroller = new Scroller();
+  private detailScroller: Scroller = new Scroller();
+  private devicesScroller: Scroller = new Scroller();
+  private meMainScroller: Scroller = new Scroller();
+  private pairingScroller: Scroller = new Scroller();
+  private passcodeScroller: Scroller = new Scroller();
+  private networkScroller: Scroller = new Scroller();
+  private diagnosticsScroller: Scroller = new Scroller();
+  private logScroller: Scroller = new Scroller();
   // Deterministic for a given (key, deviceId) pair - computed once whenever
   // the passphrase changes (or at startup, if one was already set) and
   // reused on every beacon tick, rather than re-deriving it every 2 seconds.
@@ -377,6 +459,15 @@ struct Index {
 
   aboutToAppear(): void {
     this.immersiveSupported = uiMaterial.isImmersiveMaterialSupported();
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      this.accentTheme = this.deviceSettings.getAccentThemeSync(ctx);
+      this.bottomGlowOn = this.deviceSettings.getBottomGlowSync(ctx);
+      this.cardTransparency = this.deviceSettings.getCardTransparencySync(ctx);
+      this.watcher.restoreSeen(this.deviceSettings.getLastSeenClipCountSync(ctx));
+    } catch (e) {
+      // unreadable prefs - keep the defaults
+    }
 
     // Initial (home) route on each stack, pushed with animation off (the
     // `false` second argument) - matches Huawei's own documented pattern
@@ -393,10 +484,17 @@ struct Index {
       const avoidArea = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
       this.topInsetVp = px2vp(avoidArea.topRect.height);
       this.bottomInsetVp = px2vp(avoidArea.bottomRect.height);
+      // The HDS title bar positions itself from the LIVE safe area
+      // (avoidLayoutSafeArea), so content clearance has to follow changes
+      // too (split screen, floating window, rotation) or the two disagree.
+      this.mainWindow = win;
+      win.on('avoidAreaChange', this.onAvoidAreaChange);
+      this.windowHeightVp = px2vp(win.getWindowProperties().windowRect.height);
+      win.on('windowSizeChange', this.onWindowSizeChange);
     }).catch(() => { /* fall back to zero insets if the query fails */ });
 
     this.watcher.onPasteboardChanged(() => {
-      this.pendingChange = true;
+      if (this.noticeOnOpen) this.pendingChange = true;
     });
     this.watcher.startListening();
 
@@ -404,16 +502,9 @@ struct Index {
     this.fileStore = fileStore;
     const syncManager = new SyncManager(fileStore, this.trustStore, context);
     syncManager.onEntryApplied((entry: ClipboardEntry, result: ApplyResult, fromPeer: boolean) => {
-      const item: SyncedItem = {
-        id: entry.Signature ?? `${entry.DeviceId}:${entry.Timestamp}`,
-        type: entry.Type,
-        preview: previewFor(entry),
-        content: entry.Content,
-        source: this.sourceLabelFor(entry.DeviceId),
-        time: entry.Timestamp.slice(11, 16),
-        fromPeer,
-      };
-      this.syncedItems = [item, ...this.syncedItems].slice(0, 50);
+      netLog(`entry received: type=${entry.Type} result=${result}`);
+      if (result === 'applied') this.noteOwnClipboardWrite();
+      this.syncedItems = [this.syncedItemFor(entry, fromPeer), ...this.syncedItems].slice(0, 50);
     });
     syncManager.onLog((message: string) => {
       this.log(message);
@@ -431,6 +522,7 @@ struct Index {
     // listened on, so no traffic flowed and the peer redialled every 2s.
     // Per-row status is derived in deviceRows() instead.
     syncManager.onConnectionsChanged((count: number) => {
+      netLog(`connections=${count}`);
       this.connectedCount = count;
     });
     this.syncManager = syncManager;
@@ -480,6 +572,7 @@ struct Index {
       this.ownDeviceId = id;
       netLog(`ownDeviceId=${id}`);
       this.refreshPairingPayload();
+      void this.loadHistoryIntoList();
       // Same helper the foreground restart uses, and its failure is
       // surfaced rather than swallowed - a bind failure here means no
       // peer is ever discovered, which previously looked like "sync just
@@ -504,6 +597,8 @@ struct Index {
 
     void this.refreshTrustedDevices();
     void this.loadTailscaleIp();
+    void this.loadSyncSettings();
+    this.refreshLocalAddresses();
     // setInterval doesn't fire immediately - the explicit call above (now
     // correctly sequenced after ownDeviceId is set) is what actually makes
     // a just-reopened app try reconnecting right away instead of sitting
@@ -543,6 +638,16 @@ struct Index {
   onPageShow(): void {
     void this.restartDiscovery();
     void this.reconnectOffLanPeers();
+    this.refreshLocalAddresses();
+    // HarmonyOS's closest equivalent of Android's "send my clipboard when I
+    // open ClipLink": reading the clipboard needs READ_PASTEBOARD (an ACL-only
+    // restricted permission) or a PasteButton tap, so the app can't send it
+    // on its own - but getChangeCount needs no permission, so it can at
+    // least point at the Paste button when something new was copied while
+    // ClipLink was in the background ('update' callbacks can't run then).
+    if (this.noticeOnOpen && this.watcher.hasUnseenChange()) {
+      this.pendingChange = true;
+    }
   }
 
   private async restartDiscovery(): Promise<void> {
@@ -574,6 +679,8 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.mainWindow?.off('avoidAreaChange', this.onAvoidAreaChange);
+    this.mainWindow?.off('windowSizeChange', this.onWindowSizeChange);
     this.watcher.stopListening();
     void this.discovery.stop();
     this.tcpServer.stop();
@@ -620,6 +727,7 @@ struct Index {
     const previous = this.meScreen;
     this.meScreen = screen;
     this.pairingOpen = screen === 'pairing';
+    if (screen !== 'passcode') this.passcodeChanging = false;
     if (screen === 'main' && previous !== 'main') {
       this.meNavStack.pop(true);
       if (this.pairingReturnTab >= 0) {
@@ -628,10 +736,13 @@ struct Index {
       }
     } else if (screen !== 'main' && previous === 'main') {
       this.meNavStack.pushPath({ name: screen }, true);
+    } else if (screen !== 'main' && screen !== previous) {
+      // Sub-screen to sub-screen: only happens via the Devices tab's "+"
+      // while Me was left on another sub-screen (e.g. Tailscale IP). Without
+      // this, meScreen/pairingOpen said 'pairing' while the stack still
+      // showed the old screen - pairing mode open with no Pairing screen.
+      this.meNavStack.replacePath({ name: screen }, false);
     }
-    // No sub-screen ever navigates directly to another sub-screen (every
-    // one's back button returns to 'main' first) - so those are the only
-    // two transitions this needs to handle.
   }
 
   private async refreshTrustedDevices(): Promise<void> {
@@ -918,6 +1029,97 @@ struct Index {
     this.refreshPairingPayload();
   }
 
+  private async loadSyncSettings(): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    this.autoApply = await this.deviceSettings.getAutoApply(context);
+    this.syncManager?.setAutoApply(this.autoApply);
+    this.noticeOnOpen = await this.deviceSettings.getNoticeNewCopies(context);
+    // onPageShow has usually already run by now using the default (on), so
+    // settle the hint against the real setting.
+    this.pendingChange = this.noticeOnOpen && this.watcher.hasUnseenChange();
+  }
+
+  private async setAutoApply(value: boolean): Promise<void> {
+    this.autoApply = value;
+    this.syncManager?.setAutoApply(value);
+    const context = getContext(this) as common.UIAbilityContext;
+    await this.deviceSettings.setAutoApply(context, value);
+  }
+
+  private async setNoticeNewCopies(value: boolean): Promise<void> {
+    this.noticeOnOpen = value;
+    // Turning it back on should point at a copy made while it was off.
+    this.pendingChange = value && this.watcher.hasUnseenChange();
+    const context = getContext(this) as common.UIAbilityContext;
+    await this.deviceSettings.setNoticeNewCopies(context, value);
+  }
+
+  private async setBottomGlow(value: boolean): Promise<void> {
+    this.bottomGlowOn = value;
+    await this.deviceSettings.setBottomGlow(getContext(this) as common.UIAbilityContext, value);
+  }
+
+  private async saveCardTransparency(percent: number): Promise<void> {
+    await this.deviceSettings.setCardTransparency(getContext(this) as common.UIAbilityContext, percent);
+  }
+
+  private async setAccentTheme(key: string): Promise<void> {
+    if (key === this.selectedThemeKey()) return;
+    this.accentTheme = key;
+    const context = getContext(this) as common.UIAbilityContext;
+    await this.deviceSettings.setAccentTheme(context, key);
+  }
+
+  // IPv4 only and no loopback, matching Android's localAddresses(). Includes
+  // any VPN interface the system reports as a network (e.g. Tailscale).
+  private refreshLocalAddresses(): void {
+    try {
+      const found: string[] = [];
+      for (const net of connection.getAllNetsSync()) {
+        const props = connection.getConnectionPropertiesSync(net);
+        for (const link of props.linkAddresses) {
+          const addr: string = link.address.address;
+          if (addr.includes(':') || addr.startsWith('127.') || found.includes(addr)) continue;
+          found.push(addr);
+        }
+      }
+      this.localAddresses = found;
+    } catch (e) {
+      this.localAddresses = [];
+    }
+  }
+
+  async clearPassphrase(): Promise<void> {
+    const context = getContext(this) as common.UIAbilityContext;
+    await this.passphraseKeyStore.clearPassphrase(context);
+    this.passcodeChanging = false;
+    this.passphraseInput = '';
+    await this.refreshPassphraseState();
+    promptAction.showToast({ message: 'Passcode cleared.' });
+  }
+
+  private confirmClearHistory(): void {
+    this.getUIContext().showAlertDialog({
+      title: 'Clear synced history?',
+      message: 'Removes every synced item and any files saved for them from this device. Paired devices keep their own copies, and may send them back when they next reconnect.',
+      primaryButton: { value: 'Cancel', action: () => {} },
+      secondaryButton: { value: 'Clear', fontColor: $r('sys.color.warning'), action: () => { void this.clearSyncedHistory(); } },
+    });
+  }
+
+  private async clearSyncedHistory(): Promise<void> {
+    // An open preview would be left showing an item that no longer exists.
+    if (this.syncedNavStack.size() > 1) {
+      this.syncedNavStack.pop(false);
+    }
+    this.selectedItemId = '';
+    // Emptied before the await, so an item that arrives while the clear is
+    // running (and is saved after it) stays listed instead of being wiped.
+    this.syncedItems = [];
+    await this.syncManager?.clearHistory();
+    promptAction.showToast({ message: 'History cleared.' });
+  }
+
   async saveTailscaleIp(): Promise<void> {
     if (this.savingTailscaleIp) return; // already running - ignore a double-tap
     this.savingTailscaleIp = true;
@@ -966,6 +1168,7 @@ struct Index {
       const context = getContext(this) as common.UIAbilityContext;
       await this.passphraseKeyStore.setPassphrase(context, passphrase);
       this.passphraseInput = '';
+      this.passcodeChanging = false;
       await this.refreshPassphraseState();
       promptAction.showToast({ message: 'Passcode set — matching devices will auto-trust.', duration: 3000 });
     } catch (e) {
@@ -1125,7 +1328,35 @@ struct Index {
   async copyPairingPayload(): Promise<void> {
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.myPairingPayload);
     await pasteboard.getSystemPasteboard().setData(data);
+    this.noteOwnClipboardWrite();
     promptAction.showToast({ message: 'Pairing info copied — paste it into Windows\' Trust a Device dialog.', duration: 3000 });
+  }
+
+  async copyDeviceId(): Promise<void> {
+    if (this.ownDeviceId.length === 0) return;
+    try {
+      const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.ownDeviceId);
+      await pasteboard.getSystemPasteboard().setData(data);
+      this.noteOwnClipboardWrite();
+      promptAction.showToast({ message: 'Device ID copied.' });
+    } catch (e) {
+      promptAction.showToast({ message: 'Could not copy — try again.' });
+    }
+  }
+
+  // After this app writes to the clipboard, the clipboard holds OUR data -
+  // so it must not be flagged as a new copy to send, and any earlier "new
+  // copy" hint now points at content that's been overwritten.
+  private noteOwnClipboardWrite(): void {
+    this.markClipboardSeen();
+    this.pendingChange = false;
+  }
+
+  private markClipboardSeen(): void {
+    const count: number = this.watcher.markSeen();
+    if (count >= 0) {
+      void this.deviceSettings.setLastSeenClipCount(getContext(this) as common.UIAbilityContext, count);
+    }
   }
 
   async onPasteButtonClick(result: PasteButtonOnClickResult) {
@@ -1135,6 +1366,7 @@ struct Index {
     }
     const context = getContext(this) as common.UIAbilityContext;
     const change = await this.watcher.readCurrentClipboard(context);
+    this.markClipboardSeen();
     this.pendingChange = false;
     if (change === null) {
       promptAction.showToast({ message: 'Clipboard unchanged since last sync.' });
@@ -1182,16 +1414,7 @@ struct Index {
     // path) populates. Without this, the device that actually captured
     // and sent something never saw it in its own Synced list at all -
     // only the receiving peer did.
-    const item: SyncedItem = {
-      id: entry.Signature ?? `${entry.DeviceId}:${entry.Timestamp}`,
-      type: entry.Type,
-      preview: previewFor(entry),
-      content: entry.Content,
-      source: 'This device',
-      time: entry.Timestamp.slice(11, 16),
-      fromPeer: false,
-    };
-    this.syncedItems = [item, ...this.syncedItems].slice(0, 50);
+    this.syncedItems = [this.syncedItemFor(entry, false), ...this.syncedItems].slice(0, 50);
 
     const count = this.syncManager?.connectionCount ?? 0;
     promptAction.showToast({
@@ -1221,7 +1444,7 @@ struct Index {
   copyItemContent(item: SyncedItem): void {
     const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, item.content);
     pasteboard.getSystemPasteboard().setData(data)
-      .then(() => { promptAction.showToast({ message: 'Copied to clipboard.' }); })
+      .then(() => { this.noteOwnClipboardWrite(); promptAction.showToast({ message: 'Copied to clipboard.' }); })
       .catch(() => { promptAction.showToast({ message: 'Could not copy — try again.' }); });
   }
 
@@ -1550,16 +1773,6 @@ struct Index {
     });
   }
 
-  // A plain method, not a local variable inside glassTitleBar - ArkTS's
-  // "UI component syntax" builders don't allow a variable declaration in
-  // their own body at all (even one leading statement before the first
-  // component), only real method calls used inline within the tree. This
-  // is how glassTitleBar's 'actions' trailing slot gets the item its
-  // Copy/Share buttons should act on.
-  private currentDetailItem(): SyncedItem | undefined {
-    return this.syncedItems.find(i => i.id === this.selectedItemId);
-  }
-
   // Reads syncManager.isConnected() directly; connectedCount changing is
   // what re-runs this builder
   // for why: that used to only "live update" incidentally, as a side
@@ -1630,6 +1843,34 @@ struct Index {
     return Array.from(rows.values());
   }
 
+  private syncedItemFor(entry: ClipboardEntry, fromPeer: boolean): SyncedItem {
+    return {
+      id: entry.Signature ?? `${entry.DeviceId}:${entry.Timestamp}`,
+      type: entry.Type,
+      preview: previewFor(entry),
+      content: entry.Content,
+      source: this.sourceLabelFor(entry.DeviceId),
+      time: entry.Timestamp.slice(11, 16),
+      fromPeer,
+    };
+  }
+
+  // The list used to be filled only by live callbacks, so it came up empty
+  // after every restart even though up to 25 entries were saved (Android
+  // rebuilds its list from history the same way). Needs ownDeviceId, to tell
+  // this device's own entries from peers'.
+  private async loadHistoryIntoList(): Promise<void> {
+    const saved: ClipboardEntry[] = (await this.syncManager?.getHistory()) ?? [];
+    // Timestamps are .NET round-trip ISO strings, which sort as text.
+    const restored: SyncedItem[] = saved
+      .slice()
+      .sort((a: ClipboardEntry, b: ClipboardEntry) => a.Timestamp < b.Timestamp ? 1 : (a.Timestamp > b.Timestamp ? -1 : 0))
+      .map((entry: ClipboardEntry) => this.syncedItemFor(entry, entry.DeviceId !== this.ownDeviceId));
+    // Anything that arrived live while this was loading stays on top.
+    const liveIds: Set<string> = new Set(this.syncedItems.map((i: SyncedItem) => i.id));
+    this.syncedItems = [...this.syncedItems, ...restored.filter((i: SyncedItem) => !liveIds.has(i.id))].slice(0, 50);
+  }
+
   // Human-readable label for whichever device an item came from. A raw
   // public key fragment ("MFkwEwYHKoZI...") was being used as the card's
   // byline, which is both meaningless to read and visually identical for
@@ -1641,6 +1882,22 @@ struct Index {
       return known.address;
     }
     return 'Other device';
+  }
+
+  // The app's one accent colour, from the chosen theme. HarmonyOS gives apps
+  // no wallpaper palette (Android's "use wallpaper colours") and no
+  // user-facing system accent, so the Me screen offers a theme picker
+  // instead. Read during build, so every call site re-renders on a change.
+  private accent(): ResourceColor {
+    return themeFor(this.accentTheme).color;
+  }
+
+  private selectedThemeKey(): string {
+    return themeFor(this.accentTheme).key;
+  }
+
+  private selectedThemeName(): string {
+    return themeFor(this.accentTheme).name;
   }
 
   private materialCard(): uiMaterial.ImmersiveMaterial {
@@ -1658,7 +1915,7 @@ struct Index {
       style: uiMaterial.ImmersiveStyle.THIN,
       interactive: true,
       colorInvert: true,
-      lightEffect: { color: $r('app.color.brand_blue') },
+      lightEffect: { color: this.accent() },
     });
   }
 
@@ -1669,7 +1926,7 @@ struct Index {
     return new uiMaterial.ImmersiveMaterial({
       style: uiMaterial.ImmersiveStyle.THIN,
       interactive: true,
-      lightEffect: { color: $r('app.color.brand_blue') },
+      lightEffect: { color: this.accent() },
     });
   }
 
@@ -1688,22 +1945,54 @@ struct Index {
   // because it supplies both its own fill and its own contrast.
   // ---------------------------------------------------------------------
 
-  // Card/surface for a synced item - one neutral token for every type.
+  // Surface for every card. An opaque app colour rather than
+  // sys.color.comp_background_list_card: that token is translucent in dark
+  // mode (about 10% white - measured on-device as RGB 25 over black, but
+  // warm-tinted once the bottom glow was behind it), so the glow showed
+  // through the cards. card_surface is the same colour it resolves to over
+  // the black page (#191919), and white in light mode.
   private cardSurface(): ResourceColor {
-    return $r('sys.color.comp_background_list_card');
+    return $r('app.color.card_surface');
   }
 
-  // Solid fill behind a type's glyph. These stay literal rather than
-  // tokenized: there is no purple/amber in the system palette, and a
-  // saturated chip with a white glyph needs no theme adaptation - it is
-  // its own contrast pair in both modes (the same reason iOS-style
-  // settings icons are fixed colors).
-  private typeChipColor(kind: string): ResourceColor {
-    if (kind === 'image') return '#9333EA';
-    if (kind === 'file') return '#D97706';
-    if (kind === 'link') return '#0891B2';
-    if (kind === 'key') return '#64748B';
-    return '#2563EB'; // plain text
+  // A card's backgroundColor: card_surface with the "Card transparency"
+  // setting applied as the colour's own alpha, so only the surface fades -
+  // an .opacity() on the card would fade its text and icons too.
+  //
+  // Deliberately not a .background(builder) layer: those never re-render
+  // (on-device, the fill ignored the slider whether the value was read in
+  // the builder, passed in as an argument, or held by a child component
+  // with its own @StorageProp - a background layer isn't part of the page's
+  // UI tree, so its updates are never flushed). A plain attribute is.
+  private cardFill(): ResourceColor {
+    if (this.cardTransparency <= 0) {
+      return this.cardSurface();
+    }
+    return this.colorWithAlpha($r('app.color.card_surface'), 1 - this.cardTransparency / 100);
+  }
+
+  // A colour resource's ARGB for the current light/dark mode. Cached per
+  // mode; reading colorMode here is also what re-runs the caller's
+  // attribute when the mode flips.
+  private resolveColor(res: Resource): number {
+    const key: string = `${this.colorMode}:${res.id}`;
+    let argb: number | undefined = this.resolvedColors.get(key);
+    if (argb === undefined) {
+      argb = getContext(this).resourceManager.getColorSync(res.id);
+      this.resolvedColors.set(key, argb);
+    }
+    return argb;
+  }
+
+  // '#AARRGGBB' for a colour resource with its alpha scaled by `alpha`
+  // (0-1). A string rather than a number: ArkUI reads a number whose top
+  // byte is 0 as opaque RGB, so a fully transparent colour would come out
+  // solid.
+  private colorWithAlpha(res: Resource, alpha: number): string {
+    const argb: number = this.resolveColor(res);
+    const a: number = Math.round(((argb >>> 24) & 0xFF) * Math.min(1, Math.max(0, alpha)));
+    const rgb: number = argb & 0xFFFFFF;
+    return `#${a.toString(16).padStart(2, '0')}${rgb.toString(16).padStart(6, '0')}`;
   }
 
   // Icon for a content type. 'link' and 'key' are display-only refinements
@@ -1802,15 +2091,17 @@ struct Index {
       Stack() {
         // White is baked into the chip SVGs rather than applied with
         // .fillColor(), which does not reach stroke-drawn art (see the
-        // settingsRow note). These sit on a saturated chip fill that does
-        // not change between themes, so one fixed white asset is correct.
+        // settingsRow note). The chip fill is always a saturated theme
+        // colour, so one fixed white asset is correct.
         Image(this.typeIcon(this.chipKindFor(item)))
           .width(size * 0.52)
           .height(size * 0.52)
       }
       .width(size)
       .height(size)
-      .backgroundColor(this.typeChipColor(this.chipKindFor(item)))
+      // The chosen theme colour for every type (the glyph carries the
+      // type), so the cards follow the theme picker like everything else.
+      .backgroundColor(this.accent())
       .borderRadius(size / 3.2)
     }
   }
@@ -1876,7 +2167,7 @@ struct Index {
     .width('100%')
     .padding(12)
     .borderRadius(18)
-    .backgroundColor(this.cardSurface())
+    .backgroundColor(this.cardFill())
     .alignItems(VerticalAlign.Center)
     // Per the official Shape Clipping reference: a child that still ends
     // up measuring wider than its parent (e.g. any other future
@@ -2009,7 +2300,7 @@ struct Index {
     .width('100%')
     .padding(12)
     .borderRadius(18)
-    .backgroundColor(this.cardSurface())
+    .backgroundColor(this.cardFill())
     .alignItems(HorizontalAlign.Start)
     .clip(true)
     .geometryTransition(item.id, { follow: true })
@@ -2068,7 +2359,7 @@ struct Index {
       .width('100%')
       .padding(8)
       .borderRadius(18)
-      .backgroundColor(this.cardSurface())
+      .backgroundColor(this.cardFill())
       .alignItems(HorizontalAlign.Start)
       // See syncedItemCard's identical comment - clip(true) backstop so
       // this card can never bleed into its WaterFlow neighbor.
@@ -2175,56 +2466,48 @@ struct Index {
       )
   }
 
-  // The back button used to be an embedded child of this Stack. It now
-  // lives in the NavDestination's title slot via the shared glassTitleBar
-  // (see syncedPageMap's 'itemDetail' branch), which is what keeps it in
-  // the same place as every other screen's back button. NOTE: an earlier
-  // round of this file claimed systemMaterial only renders inside a
-  // Navigation title bar or a Tabs bottom bar - that is WRONG. Checked
-  // against @ohos.arkui.uiMaterial.d.ts and common.d.ts:22642:
-  // systemMaterial is declared on CommonMethod, so it applies to ANY
-  // component, and is inert only when the app-level MaterialState is
-  // DISABLE or uiMaterial.isImmersiveMaterialSupported() is false. The
-  // title bar is used here for layout/consistency reasons, not because
-  // material would fail elsewhere
-  // instead (see "ohos.arkui.UIMaterial.state" in module.json5 for how it
-  // gets immersive material without any manual styling here). The top
-  // padding below still reserves the same visual space for it, since
-  // BarStyle.STACK makes the title bar float transparently OVER this
-  // content rather than pushing it down.
+  // The back button and Copy/Share live in the HDS title bar (see
+  // syncedPageMap's 'itemDetail' branch and detailTitleBar), which floats
+  // over this content - the top padding below is what keeps the content's
+  // resting position clear of it. NOTE: systemMaterial is declared on
+  // CommonMethod (common.d.ts:22642), so it applies to ANY component, and
+  // is inert only when the app-level MaterialState is DISABLE or
+  // uiMaterial.isImmersiveMaterialSupported() is false.
   @Builder
   itemDetailView(item: SyncedItem) {
     Stack({ alignContent: Alignment.TopStart }) {
-      Column({ space: 16 }) {
-        if (item.type === 'image') {
-          this.zoomableImage(`data:image/png;base64,${item.content}`)
-        } else if (this.imagePreviewUri(item) !== null) {
-          this.zoomableImage(this.imagePreviewUri(item) as string)
-        } else {
-          Scroll() {
+      if (item.type === 'image' || this.imagePreviewUri(item) !== null) {
+        Column({ space: 16 }) {
+          this.zoomableImage(item.type === 'image' ? `data:image/png;base64,${item.content}` : this.imagePreviewUri(item) as string)
+          Text(`${item.time} · ${item.source}`).fontSize(12).fontColor($r('sys.color.font_secondary'))
+        }
+        .width('100%')
+        .height('100%')
+        // Room for the floating title bar above and the tab pill below.
+        // Padding is fine here: an image preview doesn't scroll.
+        .padding({ left: 20, right: 20, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
+        .justifyContent(FlexAlign.Center)
+      } else {
+        // The Scroll fills the whole screen and the clearance goes on the
+        // content INSIDE it - same fix as the Synced list. With the padding
+        // on a container around the Scroll (as before), the Scroll's
+        // viewport stopped at the bars, so text was cut off at their edge
+        // instead of scrolling underneath the title bar and tab pill.
+        Scroll(this.detailScroller) {
+          Column({ space: 16 }) {
             Text(item.content).fontSize(16).fontColor($r('sys.color.font_primary')).copyOption(CopyOptions.LocalDevice)
+            Text(`${item.time} · ${item.source}`).fontSize(12).fontColor($r('sys.color.font_secondary'))
           }
           .width('100%')
-          .layoutWeight(1)
-          .align(Alignment.TopStart)
+          .alignItems(HorizontalAlign.Start)
+          .padding({ left: 20, right: 20, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
         }
-        Text(`${item.time} · ${item.source}`).fontSize(12).fontColor($r('sys.color.font_secondary'))
-      }
-      .width('100%')
-      .height('100%')
-      // Room at the top for the floating back button (now in the
-      // NavDestination's title bar) - topInsetVp restored since
-      // syncedTab's Navigation is no longer shifted as a whole (see
-      // syncedTab's comment); the button itself now positions via its own
-      // topInsetVp-based margin (see glassTitleBar), so this content
-      // needs the same clearance to visually start below it. Same bottom
-      // safe-area reservation every other tab uses (this.bottomInsetVp +
-      // 80) - the floating tab bar pill still overlaps this view
-      // (barOverlap applies to the whole Tabs, not per-tab), so without it
-      // long text/an image can render underneath the pill instead of
-      // stopping clear of it.
-      .padding({ left: 20, right: 20, top: this.topInsetVp + this.TITLE_BAR_HEIGHT + 8, bottom: this.bottomInsetVp + this.TAB_PILL_CLEARANCE })
-      .justifyContent(FlexAlign.Center)
+        .width('100%')
+        .height('100%')
+        .align(Alignment.TopStart)
+        // Scroll defaults to EdgeEffect.None - every other scrollable here
+        // bounces, so the preview felt dead without this.
+        .edgeEffect(EdgeEffect.Spring)      }
     }
     .width('100%')
     .height('100%')
@@ -2244,6 +2527,7 @@ struct Index {
     // nav text "failing to invert". With a themed surface the detail view
     // starts the same colour family as the page behind it, so the material
     // and its labels stay put.
+    // Plain - no bottom glow on the full-bleed preview.
     .backgroundColor($r('sys.color.background_primary'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     // Content component gets geometryTransition, per Huawei's Navigation
@@ -2255,11 +2539,10 @@ struct Index {
   }
 
 
-  // Height of a floating title bar's content row, BELOW the status bar -
-  // the bar's own box is this plus topInsetVp, so the frosted material
-  // reaches the very top of the screen rather than leaving a bare strip
-  // above it.
-  private readonly TITLE_BAR_HEIGHT: number = 52;
+  // Height of the HDS title bar in HdsNavDestinationTitleMode.MINI (fixed
+  // at 56vp per the enum's own doc), BELOW the status bar. Content starts
+  // this far down (plus topInsetVp) at rest and scrolls up underneath it.
+  private readonly TITLE_BAR_HEIGHT: number = 56;
   // What a scrollable has to reserve at the bottom so its last item can
   // settle clear of the floating tab pill (content still scrolls THROUGH
   // this region - it's clearance for the resting position, not a wall).
@@ -2269,149 +2552,126 @@ struct Index {
   // rest underneath the paste button.
   private readonly SYNCED_BOTTOM_CLEARANCE: number = 152;
 
-  // Material for a floating navigation bar. Distinct from buttonMaterial:
-  // no interactive/lightEffect (a whole bar shouldn't deform or chase the
-  // finger), but applyShadow so it separates from content scrolling under
-  // it, and colorInvert so its own labels re-tint against whatever passes
-  // beneath.
-  private barMaterial(): uiMaterial.ImmersiveMaterial {
-    return new uiMaterial.ImmersiveMaterial({
-      style: uiMaterial.ImmersiveStyle.THIN,
-      applyShadow: true,
-      colorInvert: true,
-    });
+  // The soft theme-colour glow along the bottom of every page (except the
+  // preview): the accent at the screen edge fading out well above the
+  // Synced tab's Paste button, the same height on every page so it doesn't
+  // jump between tabs. Set as the page container's linearGradient, which
+  // draws over its backgroundColor and under its content; the containers
+  // all expandSafeArea to the full screen, so the stops are fractions of
+  // the window height. An empty colour list is no gradient at all.
+  //
+  // An attribute rather than a .background(builder) layer for the same
+  // reason as cardFill - the layer version kept its old colour after a
+  // theme switch and ignored the on/off switch.
+  private bottomGlow(): LinearGradientOptions {
+    if (!this.bottomGlowOn) {
+      return { colors: [] };
+    }
+    const glowHeight: number = this.bottomInsetVp + GLOW_HEIGHT_ABOVE_INSET;
+    const fraction: number = this.windowHeightVp > 0 ? Math.min(1, glowHeight / this.windowHeightVp) : 0.55;
+    const accent: Resource = themeFor(this.accentTheme).color;
+    // Fades to the accent at zero alpha rather than plain transparent
+    // (black at zero alpha), which would grey the mid-tones in light mode.
+    const colors: Array<[ResourceColor, number]> = [[this.colorWithAlpha(accent, 0), 0]];
+    // Smoothstep rather than a straight fade: it holds near full strength
+    // at the bottom and eases into nothing at the top, so there's no
+    // visible edge where the glow ends. t is 1 at the glow's top, 0 at the
+    // screen's bottom edge.
+    for (let i = GLOW_STOPS; i >= 0; i--) {
+      const t: number = i / GLOW_STOPS;
+      const eased: number = t * t * (3 - 2 * t);
+      colors.push([this.colorWithAlpha(accent, GLOW_OPACITY * (1 - eased)), 1 - fraction * t]);
+    }
+    return { direction: GradientDirection.Bottom, colors: colors };
   }
 
-  // The app's one navigation bar, used by every screen.
+  // Every page's title bar is the HDS (UIDesignKit) system title bar with
+  // ScrollEffectType.GRADIENT_BLUR, replacing the old hand-built frosted
+  // "glass" Row. Per the HdsNavigation reference, GRADIENT_BLUR "gradually
+  // intensifies or lessens across the screen, featuring soft, seamless
+  // edges" and is the type recommended for non-immersive list pages - the
+  // blur is strongest behind the status bar and fades out below the title
+  // instead of stopping at a hard frosted edge. enableScrollEffect makes it
+  // fade in as content actually scrolls underneath (driven by the page's
+  // bindToScrollable scroller) rather than sitting over an empty page.
   //
-  // It lives in a NavDestination's .title() slot, which matters for two
-  // independent reasons: that slot (plus a BarPosition.End Tabs bar) is
-  // the ONLY place systemMaterial actually renders, and pairing it with
-  // BarStyle.STACK is what makes the destination hand its full box to the
-  // content so the content scrolls UNDERNEATH the bar instead of starting
-  // below it. The bar's height deliberately includes topInsetVp so the
-  // frosted material covers the status bar too - content passing behind
-  // the clock/battery is the whole point of the immersive treatment.
+  // systemMaterialEffect ADAPTIVE lets the system apply immersive material
+  // to the bar's own back/menu buttons where the device supports it.
   //
-  // `back` and `trailing` are plain string discriminators rather than
-  // callbacks/slot builders: ArkTS's UI syntax only accepts direct calls
-  // to real @Builder methods inside a builder body, so a closure
-  // parameter invoked as content() is a compile error.
-  @Builder
-  glassTitleBar(title: string, back: string, trailing: string) {
-    Row({ space: 6 }) {
-      if (back !== 'none') {
-        Button() {
-          Image($r('app.media.ic_chevron_back'))
-            .width(24)
-            .height(24)
-        }
-        .type(ButtonType.Circle)
-        .width(40)
-        .height(40)
-        // Material renders against the layout bounding box, which stays
-        // square even when ButtonType.Circle clips the visuals - the
-        // immersive-light FAQ's fix for that mismatch is exactly an
-        // explicit clipShape matching the visible shape.
-        .clipShape(new CircleShape({ width: 40, height: 40 }))
-        // Explicitly transparent: a plain Button carries its own opaque
-        // default fill even if backgroundColor is never called, and any
-        // opaque background sits on top of the material and hides it.
-        .backgroundColor(Color.Transparent)
-        .systemMaterial(this.buttonMaterial())
-        // Brief delay so the press/haptic lands visibly before the pop
-        // animation starts cutting the screen away.
-        .onClick(() => {
+  // These return plain option objects rather than being @Builders: the
+  // title bar is data handed to HdsNavDestination.titleBar(), and a method
+  // (not a local variable) is how a builder body is allowed to compute it.
+  private hdsTitleBar(title: string, isRoot: boolean, menu: HdsNavigationMenuItemOptions[]): HdsNavigationTitleBarOptions {
+    return {
+      // Every destination ignores the top safe area so content can scroll up
+      // behind the status bar - without this the title bar followed it and
+      // drew its title and menu on top of the clock and battery (seen
+      // on-device). With it, the bar's content sits below the status bar
+      // while its blur still reaches the top of the screen.
+      avoidLayoutSafeArea: true,
+      style: {
+        scrollEffectOpts: {
+          enableScrollEffect: true,
+          scrollEffectType: ScrollEffectType.GRADIENT_BLUR,
+        },
+        systemMaterialEffect: {
+          materialType: hdsMaterial.MaterialType.ADAPTIVE,
+          materialLevel: hdsMaterial.MaterialLevel.ADAPTIVE,
+        },
+      },
+      content: {
+        title: {
+          mainTitle: title,
+          mainTitleSize: isRoot ? TitleSize.TITLE_ML : TitleSize.TITLE_S,
+        },
+        menu: { value: menu },
+      },
+    };
+  }
+
+  // Synced tab: one menu icon that flips between list and grid. It shows
+  // the layout you'd switch TO, the usual convention for a two-state view
+  // toggle. viewMode is passed in (read at the call site) rather than read
+  // here so the title bar re-evaluates when it changes.
+  private syncedTitleBar(viewMode: string): HdsNavigationTitleBarOptions {
+    const toGrid: boolean = viewMode === 'list';
+    return this.hdsTitleBar('Synced', true, [{
+      content: {
+        label: toGrid ? 'Grid view' : 'List view',
+        icon: toGrid ? $r('sys.symbol.square_grid_2x2') : $r('sys.symbol.list_bullet'),
+        action: () => {
           tapHaptic();
-          setTimeout(() => {
-            if (back === 'me') {
-              this.setMeScreen('main');
-            } else {
-              this.closeItemDetail();
-            }
-          }, 50);
-        })
-      }
+          this.syncedViewMode = toGrid ? 'waterfall' : 'list';
+        },
+      },
+    }]);
+  }
 
-      Text(title)
-        .fontSize(back === 'none' ? 26 : 20)
-        .fontWeight(FontWeight.Bold)
-        .fontColor($r('sys.color.font_primary'))
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .layoutWeight(1)
-
-      if (trailing === 'actions') {
-        // Copy/Share for the item preview page, matching what the Android
-        // app's own detail screen offers - deliberately NOT a delete
-        // button here too (a request-level decision, not an oversight):
-        // deleting from a full-bleed preview is a much easier accidental
-        // tap than from the long-press menu deleting already lives in.
-        //
-        // Type-conditional (text gets Copy, image/file gets Share), same
-        // split itemActionMenu's long-press menu already uses - Android
-        // shows both unconditionally, but this app's copyItemContent is
-        // deliberately text-only (see its own comment: dumping an image's
-        // raw base64 onto the clipboard as literal text was a real,
-        // already-fixed bug, and offering "Copy" for a file entry would
-        // do the exact same thing with its JSON descriptor instead).
-        if (this.currentDetailItem()?.type === 'text') {
-          Button() {
-            Image($r('app.media.ic_menu_copy')).width(22).height(22)
-          }
-          .type(ButtonType.Circle)
-          .width(40)
-          .height(40)
-          .clipShape(new CircleShape({ width: 40, height: 40 }))
-          .backgroundColor(Color.Transparent)
-          .systemMaterial(this.buttonMaterial())
-          .onClick(() => {
-            tapHaptic();
-            const item = this.currentDetailItem();
-            if (item) this.copyItemContent(item);
-          })
-        } else if (this.currentDetailItem() !== undefined) {
-          Button() {
-            Image($r('app.media.ic_menu_share')).width(22).height(22)
-          }
-          .type(ButtonType.Circle)
-          .width(40)
-          .height(40)
-          .clipShape(new CircleShape({ width: 40, height: 40 }))
-          .backgroundColor(Color.Transparent)
-          .systemMaterial(this.buttonMaterial())
-          .onClick(() => {
-            tapHaptic();
-            const item = this.currentDetailItem();
-            if (item) void this.shareItem(item);
-          })
-        }
-      }
-
-      if (trailing === 'viewmode') {
-        // The real system segmented control, not a pair of hand-styled
-        // Texts pretending to be one. Beyond matching the platform's own
-        // sliding-thumb behaviour and accessibility, SegmentButton is on
-        // the list of components that pick up immersive material on their
-        // own when the app-level switch is "enable" (module.json5's
-        // ohos.arkui.UIMaterial.state) - so it is materialised by the
-        // framework rather than by a systemMaterial call here.
-        SegmentButton({
-          options: this.viewModeOptions,
-          selectedIndexes: $viewModeSelection,
-          onItemClicked: (index: number) => {
-            tapHaptic();
-            this.syncedViewMode = index === 0 ? 'list' : 'waterfall';
-          },
-        })
-          .width(148)
-      }
+  // Item preview: Copy for text, Share for images/files - the same split
+  // itemActionMenu's long-press menu uses. copyItemContent is deliberately
+  // text-only (copying an image's raw base64, or a file's JSON descriptor,
+  // as literal text was a real, already-fixed bug). No Delete here by
+  // request: it's a much easier accidental tap from a full-bleed preview
+  // than from the long-press menu it already lives in.
+  private detailTitleBar(itemId: string): HdsNavigationTitleBarOptions {
+    const item: SyncedItem | undefined = this.syncedItems.find(i => i.id === itemId);
+    if (item === undefined) return this.hdsTitleBar('', false, []);
+    if (item.type === 'text') {
+      return this.hdsTitleBar('', false, [{
+        content: {
+          label: 'Copy',
+          icon: $r('sys.symbol.rectangle_on_rectangle'),
+          action: () => { tapHaptic(); this.copyItemContent(item); },
+        },
+      }]);
     }
-    .width('100%')
-    .height(this.topInsetVp + this.TITLE_BAR_HEIGHT)
-    .padding({ left: back === 'none' ? 20 : 10, right: 14, top: this.topInsetVp })
-    .alignItems(VerticalAlign.Center)
-    .systemMaterial(this.barMaterial())
+    return this.hdsTitleBar('', false, [{
+      content: {
+        label: 'Share',
+        icon: $r('sys.symbol.share'),
+        action: () => { tapHaptic(); void this.shareItem(item); },
+      },
+    }]);
   }
 
   // Wraps the list and the item-detail view as two NavDestinations on their
@@ -2419,12 +2679,9 @@ struct Index {
   // to be. Two reasons this had to change, both confirmed against Huawei's
   // own docs while investigating why the detail view's back button never
   // showed immersive material:
-  // 1. Consistency: every screen's chrome now comes from one shared
-  //    glassTitleBar in the destination's title slot, instead of each
+  // 1. Consistency: every screen's chrome comes from the destination's own
+  //    title bar (now the HDS one - see hdsTitleBar), instead of each
   //    screen positioning its own floating button with its own offsets.
-  //    (An earlier revision justified this by claiming systemMaterial
-  //    can ONLY render in a title bar or Tabs bar - that claim was
-  //    wrong; see itemDetailView's note.)
   // 2. geometryTransition (the "一镜到底" shared-element morph the list card
   //    and detail view already relied on) is ONLY supported between two
   //    NavDestinations - a transition between Navigation's NavBar and a
@@ -2433,9 +2690,13 @@ struct Index {
   //    NavDestination for immersive material to work, the list side of the
   //    animation has to be a NavDestination too, not plain NavBar content,
   //    or the shared-element morph would just stop working.
+  // HdsNavigation rather than plain Navigation: per the HdsNavDestination
+  // reference, an HdsNavDestination only has routing and its HDS title bar
+  // behaviour when hosted by an HdsNavigation - on its own it degrades to a
+  // plain container.
   @Builder
   syncedTab() {
-    Navigation(this.syncedNavStack) {
+    HdsNavigation(this.syncedNavStack) {
       // Intentionally empty - hideNavBar means this NavBar content is
       // never actually shown. 'syncedList' (pushed in aboutToAppear) is
       // the real home screen; see syncedPageMap below.
@@ -2454,23 +2715,24 @@ struct Index {
     // padding/margin to stay clear. Shifting the whole Navigation fixed
     // clipping but also blocked every child from ever reaching the status
     // bar at all, including the scrollable content that's supposed to
-    // extend behind it - see syncedListContent/glassTitleBar for the
-    // per-component split this replaced it with.
+    // extend behind it - see syncedListContent for the per-component split
+    // this replaced it with.
   }
 
 
   @Builder
   syncedPageMap(name: string) {
     if (name === 'syncedList') {
-      NavDestination() {
+      HdsNavDestination() {
         this.syncedListContent()
       }
-      // A real frosted title bar now, not the zero-size placeholder this
-      // used to pass: the page title and List/Grid toggle moved up here
-      // from the content, so they get immersive material (only ever
-      // rendered in this slot or a bottom Tabs bar) and the list scrolls
-      // underneath them rather than starting below them.
-      .title(this.glassTitleBar('Synced', 'none', 'viewmode'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      // syncedViewMode is read here, in the attribute expression itself, so
+      // the title bar (and its list/grid icon) re-evaluates when it flips.
+      .titleBar(this.syncedTitleBar(this.syncedViewMode))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      // Both scrollers: only one of List/WaterFlow exists at a time, and
+      // whichever is showing drives the blur.
+      .bindToScrollable([this.syncedListScroller, this.syncedFlowScroller])
       .hideBackButton(true)
       // Checked the SDK's own common.d.ts/nav_destination.d.ts directly
       // (the doc site wasn't loading) - expandSafeArea (used below, on
@@ -2481,28 +2743,24 @@ struct Index {
       // WaterFlow/Swiper/Tabs by name as the scrollable components this
       // matters for, which is exactly the symptom here (grid content
       // overlapping/spilling because its container's real layout size
-      // was smaller than what was visible). Prerequisite (title hidden or
-      // BarStyle.STACK) is already satisfied by the .title() call above.
+      // was smaller than what was visible).
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     } else if (name === 'itemDetail') {
-      NavDestination() {
+      HdsNavDestination() {
         if (this.syncedItems.find(i => i.id === this.selectedItemId)) {
           this.itemDetailView(this.syncedItems.find(i => i.id === this.selectedItemId) as SyncedItem)
         }
       }
-      // Same shared bar as every other screen, with a back affordance -
-      // the detail view's back button used to be its own separately
-      // positioned floating circle with its own hand-tuned topInsetVp
-      // margin, which is why it kept landing in a different place from
-      // the Me sub-screens' equally hand-tuned one. Both are now the same
-      // component in the same slot.
-      .title(this.glassTitleBar('', 'detail', 'actions'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
-      .hideBackButton(true)
-      // System back gesture AND a tap on the native back button both
-      // funnel through this same interception point - needed so either
-      // one goes through the same animateTo-wrapped pop as closeItemDetail
-      // uses, not a plain default pop that would skip the
-      // geometryTransition morph entirely.
+      .titleBar(this.detailTitleBar(this.selectedItemId))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.detailScroller])
+      // The HDS bar's own back button, rather than a custom one. Its tap
+      // and the system back gesture both land in onBackPressed below
+      // (deliberately no backIcon.action as well - the HDS reference
+      // advises against setting both), so either one goes through the
+      // animateTo-wrapped pop in closeItemDetail instead of a plain
+      // default pop that would skip the geometryTransition morph.
+      .hideBackButton(false)
       .onBackPressed(() => { this.closeItemDetail(); return true; })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     }
@@ -2550,7 +2808,25 @@ struct Index {
   // when someone would reach for it.
   @Builder
   pasteDock() {
-    Row() {
+    Row({ space: 10 }) {
+      // The "Point out new copies" hint lives on the capsule, never on
+      // PasteButton itself: a security component's look must not change at
+      // runtime or its tap can come back TEMPORARY_AUTHORIZATION_FAILED.
+      if (this.pendingChange) {
+        // Its own solid pill: the dock Row's systemMaterial doesn't render
+        // in page content (per Huawei's 开启沉浸光感 guide, generic
+        // components only get material in title bars and the bottom tab
+        // bar), so without a background this label sat bare over the cards.
+        // Points at Paste, which is what sends it.
+        Text('New item →')
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor($r('sys.color.font_on_primary'))
+          .padding({ left: 14, right: 14, top: 8, bottom: 8 })
+          .borderRadius(18)
+          .backgroundColor(this.accent())
+          .shadow(ShadowStyle.OUTER_DEFAULT_SM)
+      }
       PasteButton({ icon: PasteIconStyle.LINES, text: PasteDescription.PASTE, buttonType: ButtonType.Capsule })
         .onClick((event: ClickEvent, result: PasteButtonOnClickResult) => { tapHaptic(); void this.onPasteButtonClick(result); })
     }
@@ -2606,7 +2882,7 @@ struct Index {
       if (this.syncedItems.length === 0) {
         this.emptyState('Nothing synced yet', 'Copy something on this or another trusted device and it will appear here.', $r('app.media.ic_empty_synced'))
       } else if (this.syncedViewMode === 'list') {
-        List({ space: 10 }) {
+        List({ space: 10, scroller: this.syncedListScroller }) {
           ForEach(this.syncedItems, (item: SyncedItem) => {
             ListItem() { this.syncedItemCard(item) }
           }, (item: SyncedItem) => item.id)
@@ -2627,8 +2903,9 @@ struct Index {
         // content-under-floating-chrome case they exist for.
         .contentStartOffset(this.syncedTopClearance())
         .contentEndOffset(this.bottomInsetVp + this.SYNCED_BOTTOM_CLEARANCE)
-        .edgeEffect(EdgeEffect.Spring)
-        // Per Huawei's "如何实现沉浸式页面" FAQ: this is the component whose
+        // alwaysEnabled: a List only bounces by default once it's taller
+        // than the screen, so a short list felt dead.
+        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })        // Per Huawei's "如何实现沉浸式页面" FAQ: this is the component whose
         // own background/content should actually draw behind the status
         // bar (unlike the title row below, which stays clear via
         // topInsetVp padding instead) - lets list cards scroll up and
@@ -2638,7 +2915,7 @@ struct Index {
       } else {
         // Same WaterFlow pattern devicesTab uses below - a 2-column grid
         // rather than a single stacked list, per request.
-        WaterFlow() {
+        WaterFlow({ scroller: this.syncedFlowScroller }) {
           ForEach(this.syncedItems, (item: SyncedItem) => {
             // .width('100%') directly on FlowItem, not just on
             // syncedGridCard's own inner Column two levels down - per the
@@ -2691,14 +2968,14 @@ struct Index {
         .contentEndOffset(this.bottomInsetVp + this.SYNCED_BOTTOM_CLEARANCE)
         // WaterFlow doesn't default to Spring the way List does - without
         // this the grid view felt visually inconsistent with the list
-        // view's bounce feedback at the scroll ends.
-        .edgeEffect(EdgeEffect.Spring)
-        // See the List branch's identical comment above.
+        // view's bounce feedback at the scroll ends. alwaysEnabled so a
+        // grid shorter than the screen still bounces.
+        .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })        // See the List branch's identical comment above.
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       }
 
-      // The page title and List/Grid control live in the frosted title bar
-      // (glassTitleBar); only the paste action is pinned here, bottom
+      // The page title and List/Grid toggle live in the HDS title bar
+      // (syncedTitleBar); only the paste action is pinned here, bottom
       // aligned above the tab pill. It must stay in this content Stack
       // rather than being an overlay beside Tabs - see pasteDock.
       this.pasteDock()
@@ -2742,6 +3019,7 @@ struct Index {
     // the pairing holds in dark mode instead of inverting into another
     // same-on-same collision. It is also what the frosted bars sample.
     .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
     .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
@@ -2808,7 +3086,7 @@ struct Index {
         Button('Trust')
           .fontSize(13)
           .fontColor($r('sys.color.font_on_primary'))
-          .backgroundColor($r('app.color.brand_blue'))
+          .backgroundColor(this.accent())
           .height(34)
           .padding({ left: 16, right: 16 })
           .onClick(() => {
@@ -2837,14 +3115,14 @@ struct Index {
     // re-resolve per theme, which the old hardcoded '#FFFFFF'/'#EAF2FF'
     // pair did not: the device name follows the theme to near-white in
     // dark mode, and against a card frozen at white that was invisible.
-    .backgroundColor($r('sys.color.comp_background_list_card'))
+    .backgroundColor(this.cardFill())
     .alignItems(VerticalAlign.Center)
     .clickEffect({ level: ClickEffectLevel.MIDDLE })
   }
 
   @Builder
   devicesContent() {
-    List({ space: 10 }) {
+    List({ space: 10, scroller: this.devicesScroller }) {
       ListItem() {
         // Summary line reads as a status, not a stat: the count is the
         // part worth emphasizing, the rest is context.
@@ -2895,9 +3173,10 @@ struct Index {
     // slide under the floating bars instead of being clipped at them.
     .contentStartOffset(this.topInsetVp + this.TITLE_BAR_HEIGHT + 8)
     .contentEndOffset(this.bottomInsetVp + this.TAB_PILL_CLEARANCE)
-    .edgeEffect(EdgeEffect.Spring)
-    // See syncedListContent's note - page backdrop the card token pairs with.
+    // Usually only 1-3 devices, so without alwaysEnabled it never bounced.
+    .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })    // See syncedListContent's note - page backdrop the card token pairs with.
     .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
     .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
@@ -2920,7 +3199,7 @@ struct Index {
       .type(ButtonType.Circle)
       .width(56)
       .height(56)
-      .backgroundColor($r('app.color.brand_blue'))
+      .backgroundColor(this.accent())
       .onClick(() => { tapHaptic(); setTimeout(() => { this.openPairingFromDevices(); }, 50); })
     }
     .width('100%')
@@ -2935,10 +3214,12 @@ struct Index {
   @Builder
   devicesPageMap(name: string) {
     if (name === 'devicesMain') {
-      NavDestination() {
+      HdsNavDestination() {
         this.devicesContent()
       }
-      .title(this.glassTitleBar('Devices', 'none', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .titleBar(this.hdsTitleBar('Devices', true, []))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.devicesScroller])
       .hideBackButton(true)
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     }
@@ -2946,7 +3227,7 @@ struct Index {
 
   @Builder
   devicesTab() {
-    Navigation(this.devicesNavStack) {
+    HdsNavigation(this.devicesNavStack) {
     }
     .hideNavBar(true)
     .navDestination(this.devicesPageMap)
@@ -2968,9 +3249,12 @@ struct Index {
 
   // A single row inside a grouped settings card - consistent height/padding
   // and a trailing chevron when it navigates, so every row in the list
-  // reads as the same kind of control.
+  // reads as the same kind of control. One options object for the same
+  // reason as settingsSwitchRow: with positional parameters ArkUI passed
+  // them by value, so values like "Passcode auto-trust: On" or the Tailscale
+  // IP kept showing whatever they were on first render.
   @Builder
-  settingsRow(title: string, value: string, navigates: boolean, icon: Resource, onTap: () => void) {
+  settingsRow(opts: SettingsRowOptions) {
     Row({ space: 12 }) {
         // No .fillColor() here. Image.fillColor only recolors an SVG's
         // FILL, not its STROKE - verified on-device by zooming a rendered
@@ -2979,14 +3263,14 @@ struct Index {
         // Since this icon set is stroke-based line art, colour is baked
         // into the asset instead and light/dark ship as a
         // resources/base + resources/dark qualifier pair.
-      Image(icon)
+      Image(opts.icon)
         .width(22)
         .height(22)
-      Text(title).fontSize(14).layoutWeight(1)
-      if (value.length > 0) {
-        Text(value).fontSize(13).fontColor($r('sys.color.font_secondary'))
+      Text(opts.title).fontSize(14).layoutWeight(1)
+      if (opts.value.length > 0) {
+        Text(opts.value).fontSize(13).fontColor($r('sys.color.font_secondary'))
       }
-      if (navigates) {
+      if (opts.navigates) {
         Image($r('app.media.ic_chevron_right'))
           .width(16)
           .height(16)
@@ -2995,7 +3279,123 @@ struct Index {
     .width('100%')
     .padding({ left: 14, right: 14, top: 13, bottom: 13 })
     .clickEffect({ level: ClickEffectLevel.MIDDLE })
-    .onClick(() => { tapHaptic(); onTap(); })
+    .onClick(() => { tapHaptic(); opts.onTap(); })
+  }
+
+  // Colour theme picker: one swatch per entry in `themes`, the selected one
+  // ringed and ticked. Tapping recolours everything that uses accent()
+  // straight away (switches, the selected tab, buttons, press highlights).
+  @Builder
+  themePicker() {
+    Column({ space: 14 }) {
+      Row({ space: 12 }) {
+        Image($r('app.media.ic_settings_palette'))
+          .width(22)
+          .height(22)
+        Text('Theme').fontSize(14).fontColor($r('sys.color.font_primary')).layoutWeight(1)
+        Text(this.selectedThemeName()).fontSize(13).fontColor($r('sys.color.font_secondary'))
+      }
+      .width('100%')
+      Row() {
+        // Key includes the selected state so a swatch's ring/tick actually
+        // re-renders when the selection moves (a key-only ForEach reuses the
+        // old node - see deviceRows' ForEach for the same issue).
+        ForEach(this.themes, (theme: ThemeOption) => {
+          Stack() {
+            Circle({ width: 34, height: 34 }).fill(theme.color)
+            if (theme.key === this.selectedThemeKey()) {
+              SymbolGlyph($r('sys.symbol.checkmark'))
+                .fontSize(18)
+                .fontColor([Color.White])
+            }
+          }
+          .width(44)
+          .height(44)
+          .borderRadius(22)
+          .borderWidth(theme.key === this.selectedThemeKey() ? 2 : 0)
+          .borderColor(theme.color)
+          .accessibilityText(theme.name)
+          .onClick(() => { tapHaptic(); void this.setAccentTheme(theme.key); })
+        }, (theme: ThemeOption) => `${theme.key}:${theme.key === this.selectedThemeKey()}`)
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.SpaceBetween)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 13, bottom: 14 })
+  }
+
+  // How see-through card surfaces are (see cardFill). The API 26
+  // immersive-material Slider: like Toggle, Slider gets the material
+  // app-wide under ohos.arkui.UIMaterial.state "enable" and treats the
+  // systemMaterial argument only as an on-flag (per 组件适配沉浸光感; its
+  // light/press feedback needs the default block type and a visible
+  // style, both kept here). Updates live while dragging, saves on release.
+  @Builder
+  cardTransparencyRow() {
+    Column({ space: 4 }) {
+      Row({ space: 12 }) {
+        Image($r('app.media.ic_settings_cards'))
+          .width(22)
+          .height(22)
+        Text('Card transparency').fontSize(14).fontColor($r('sys.color.font_primary')).layoutWeight(1)
+        Text(`${Math.round(this.cardTransparency)}%`).fontSize(13).fontColor($r('sys.color.font_secondary'))
+      }
+      .width('100%')
+      Slider({ value: this.cardTransparency, min: 0, max: 100, step: 5 })
+        .width('100%')
+        .selectedColor(this.accent())
+        .systemMaterial(new uiMaterial.ImmersiveMaterial())
+        .accessibilityText('Card transparency')
+        .onChange((value: number, mode: SliderChangeMode) => {
+          this.cardTransparency = value;
+          if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+            void this.saveCardTransparency(value);
+          }
+        })
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 12, bottom: 6 })
+  }
+
+  // A settings row whose trailing control is an on/off switch.
+  //
+  // The switch is the API 26 immersive-material Toggle. Per Huawei's
+  // "组件适配沉浸光感" guide, ToggleType.Switch already gets it app-wide
+  // because module.json5 sets ohos.arkui.UIMaterial.state to "enable", and
+  // for a Switch the ImmersiveMaterial passed to systemMaterial is only an
+  // on-flag - the component uses its own built-in thumb/shadow parameters,
+  // varying by device tier. It's set explicitly anyway so the switch keeps
+  // the material style even if the app-level switch is ever changed.
+  // No switchStyle/switchPointColor overrides, since those would fight
+  // the material's own thumb styling.
+  @Builder
+  settingsSwitchRow(opts: SwitchRowOptions) {
+    Row({ space: 12 }) {
+      Image(opts.icon)
+        .width(22)
+        .height(22)
+      Column({ space: 2 }) {
+        Text(opts.title).fontSize(14).fontColor($r('sys.color.font_primary'))
+        if (opts.subtitle.length > 0) {
+          Text(opts.subtitle).fontSize(12).fontColor($r('sys.color.font_secondary'))
+        }
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+      Toggle({ type: ToggleType.Switch, isOn: opts.isOn })
+        .selectedColor(this.accent())
+        .systemMaterial(new uiMaterial.ImmersiveMaterial())
+        .enabled(opts.enabled ?? true)
+        // Without this a screen reader announced every switch as just
+        // "switch, on/off" with nothing to tell them apart.
+        .accessibilityText(opts.title)
+        .accessibilityDescription(opts.subtitle)
+        .onChange((isOn: boolean) => { tapHaptic(); opts.onChange(isOn); })
+    }
+    .width('100%')
+    .padding({ left: 14, right: 10, top: 12, bottom: 12 })
+    .alignItems(VerticalAlign.Center)
   }
 
 
@@ -3008,7 +3408,7 @@ struct Index {
   // currently on top.
   @Builder
   meTab() {
-    Navigation(this.meNavStack) {
+    HdsNavigation(this.meNavStack) {
       // Intentionally empty - hideNavBar means this is never shown;
       // 'meMain' (pushed in aboutToAppear) is the real home screen.
     }
@@ -3033,54 +3433,66 @@ struct Index {
   @Builder
   mePageMap(name: string) {
     if (name === 'meMain') {
-      NavDestination() {
+      HdsNavDestination() {
         this.meMainContent()
       }
-      .title(this.glassTitleBar('Me', 'none', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
+      .titleBar(this.hdsTitleBar('Me', true, []))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.meMainScroller])
       .hideBackButton(true)
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     } else if (name === 'pairing') {
-      // Shared glassTitleBar, same as every other screen - these five
-      // sub-screens used to each build their own back button with their
-      // own hand-tuned offsets, which is how they drifted out of
-      // alignment with the detail view's.
-      NavDestination() {
+      // Sub-screens use the HDS bar's own back button. Its tap and the
+      // system back gesture both land in onBackPressed, which routes
+      // through setMeScreen so meScreen/pairingOpen stay in step with the
+      // stack (a default pop would leave pairing mode open).
+      HdsNavDestination() {
         this.pairingScreenContent()
       }
-      .title(this.glassTitleBar('Pairing', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
-      .hideBackButton(true)
+      .titleBar(this.hdsTitleBar('Pairing', false, []))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.pairingScroller])
+      .hideBackButton(false)
       .onBackPressed(() => { this.setMeScreen('main'); return true; })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     } else if (name === 'passcode') {
-      NavDestination() {
+      HdsNavDestination() {
         this.passcodeScreenContent()
       }
-      .title(this.glassTitleBar('Passcode auto-trust', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
-      .hideBackButton(true)
+      .titleBar(this.hdsTitleBar('Passcode auto-trust', false, []))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.passcodeScroller])
+      .hideBackButton(false)
       .onBackPressed(() => { this.setMeScreen('main'); return true; })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     } else if (name === 'network') {
-      NavDestination() {
+      HdsNavDestination() {
         this.networkScreenContent()
       }
-      .title(this.glassTitleBar('Tailscale IP', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
-      .hideBackButton(true)
+      .titleBar(this.hdsTitleBar('Tailscale IP', false, []))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.networkScroller])
+      .hideBackButton(false)
       .onBackPressed(() => { this.setMeScreen('main'); return true; })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     } else if (name === 'diagnostics') {
-      NavDestination() {
+      HdsNavDestination() {
         this.diagnosticsScreenContent()
       }
-      .title(this.glassTitleBar('Diagnostics', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
-      .hideBackButton(true)
+      .titleBar(this.hdsTitleBar('Diagnostics', false, []))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.diagnosticsScroller])
+      .hideBackButton(false)
       .onBackPressed(() => { this.setMeScreen('main'); return true; })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     } else if (name === 'log') {
-      NavDestination() {
+      HdsNavDestination() {
         this.activityLogScreenContent()
       }
-      .title(this.glassTitleBar('Activity log', 'me', 'none'), { backgroundColor: Color.Transparent, barStyle: BarStyle.STACK })
-      .hideBackButton(true)
+      .titleBar(this.hdsTitleBar('Activity log', false, []))
+      .titleMode(HdsNavDestinationTitleMode.MINI)
+      .bindToScrollable([this.logScroller])
+      .hideBackButton(false)
       .onBackPressed(() => { this.setMeScreen('main'); return true; })
       .ignoreLayoutSafeArea([LayoutSafeAreaType.SYSTEM], [LayoutSafeAreaEdge.TOP, LayoutSafeAreaEdge.BOTTOM])
     }
@@ -3092,50 +3504,113 @@ struct Index {
   // clumped together.
   @Builder
   meMainContent() {
-      Scroll() {
+      Scroll(this.meMainScroller) {
         Column({ space: 16 }) {
-          // No in-flow page title here any more - "Me" lives in the
-          // frosted title bar (see mePageMap), which this content scrolls
-          // underneath.
+          // No in-flow page title here - "Me" lives in the HDS title bar
+          // (see mePageMap), which this content scrolls underneath.
           this.sectionHeader('Device')
           Column() {
             Column({ space: 4 }) {
               Text('Your device ID').fontSize(12).fontColor($r('sys.color.font_secondary'))
-              Text(this.ownDeviceId)
+              Text(this.ownDeviceId.length > 0 ? this.ownDeviceId : 'Generating identity…')
                 .fontSize(11)
                 .fontColor($r('sys.color.font_primary'))
                 .copyOption(CopyOptions.LocalDevice)
                 .wordBreak(WordBreak.BREAK_ALL)
+              if (this.localAddresses.length > 0) {
+                Text(this.localAddresses.join('  •  '))
+                  .fontSize(12)
+                  .fontColor($r('sys.color.font_secondary'))
+                  .margin({ top: 6 })
+              }
             }
             .width('100%')
             .alignItems(HorizontalAlign.Start)
             .padding(14)
+            Divider().color($r('sys.color.comp_divider'))
+            this.settingsRow({ title: 'Copy device ID', value: '', navigates: false, icon: $r('app.media.ic_menu_copy'), onTap: () => { void this.copyDeviceId(); } })
           }
           .width('100%')
           .borderRadius(16)
-          .backgroundColor($r('sys.color.comp_background_list_card'))
+          .backgroundColor(this.cardFill())
+
+          this.sectionHeader('Sync')
+          Column() {
+            this.settingsSwitchRow({
+              title: 'Copy received items automatically',
+              subtitle: 'Puts whatever arrives straight onto this device\'s clipboard.',
+              isOn: this.autoApply,
+              icon: $r('app.media.ic_settings_autocopy'),
+              onChange: (isOn: boolean) => { void this.setAutoApply(isOn); },
+            })
+            Divider().color($r('sys.color.comp_divider'))
+            // Android's "Send my clipboard when I open ClipLink" can't be
+            // ported as-is (see onPageShow) - this is what HarmonyOS allows.
+            this.settingsSwitchRow({
+              title: 'Point out new copies',
+              subtitle: 'HarmonyOS only lets ClipLink read the clipboard when you tap Paste, so this highlights Paste when you\'ve copied something new, including while ClipLink was closed.',
+              isOn: this.noticeOnOpen,
+              icon: $r('app.media.ic_settings_notice'),
+              onChange: (isOn: boolean) => { void this.setNoticeNewCopies(isOn); },
+            })
+            // No "Keep syncing in the background" (Android's keepAlive): the
+            // only continuous-task mode open to apps, multiDeviceConnection,
+            // was tried and failed on-device - the system's usage check
+            // ("check failed, not use 6") suspended it and froze the app
+            // about a minute after leaving it, since a plain TCP link to a
+            // PC isn't a HarmonyOS distributed/casting connection.
+          }
+          .width('100%')
+          .borderRadius(16)
+          .backgroundColor(this.cardFill())
+
+          this.sectionHeader('Appearance')
+          Column() {
+            this.themePicker()
+            Divider().color($r('sys.color.comp_divider'))
+            this.settingsSwitchRow({
+              title: 'Bottom glow',
+              subtitle: 'A soft wash of your theme colour along the bottom of each page.',
+              isOn: this.bottomGlowOn,
+              icon: $r('app.media.ic_settings_glow'),
+              onChange: (isOn: boolean) => { void this.setBottomGlow(isOn); },
+            })
+            Divider().color($r('sys.color.comp_divider'))
+            this.cardTransparencyRow()
+          }
+          .width('100%')
+          .borderRadius(16)
+          .backgroundColor(this.cardFill())
 
           this.sectionHeader('Pairing')
           Column() {
-            this.settingsRow('QR code & scan', '', true, $r('app.media.ic_settings_qr'), () => { this.setMeScreen('pairing'); })
+            this.settingsRow({ title: 'QR code & scan', value: '', navigates: true, icon: $r('app.media.ic_settings_qr'), onTap: () => { this.setMeScreen('pairing'); } })
             Divider().color($r('sys.color.comp_divider'))
-            this.settingsRow('Passcode auto-trust', this.hasPassphrase ? 'On' : 'Off', true, $r('app.media.ic_settings_passcode'), () => { this.setMeScreen('passcode'); })
+            this.settingsRow({ title: 'Passcode auto-trust', value: this.hasPassphrase ? 'On' : 'Off', navigates: true, icon: $r('app.media.ic_settings_passcode'), onTap: () => { this.setMeScreen('passcode'); } })
             Divider().color($r('sys.color.comp_divider'))
-            this.settingsRow('Tailscale IP', this.tailscaleIp.length > 0 ? this.tailscaleIp : 'Not set', true, $r('app.media.ic_settings_network'), () => { this.setMeScreen('network'); })
+            this.settingsRow({ title: 'Tailscale IP', value: this.tailscaleIp.length > 0 ? this.tailscaleIp : 'Not set', navigates: true, icon: $r('app.media.ic_settings_network'), onTap: () => { this.setMeScreen('network'); } })
           }
           .width('100%')
           .borderRadius(16)
-          .backgroundColor($r('sys.color.comp_background_list_card'))
+          .backgroundColor(this.cardFill())
 
           this.sectionHeader('Support')
           Column() {
-            this.settingsRow('Diagnostics', '', true, $r('app.media.ic_settings_diagnostics'), () => { this.setMeScreen('diagnostics'); })
+            this.settingsRow({ title: 'Diagnostics', value: '', navigates: true, icon: $r('app.media.ic_settings_diagnostics'), onTap: () => { this.setMeScreen('diagnostics'); } })
             Divider().color($r('sys.color.comp_divider'))
-            this.settingsRow('Activity log', `${this.syncLog.length}`, true, $r('app.media.ic_settings_log'), () => { this.setMeScreen('log'); })
+            this.settingsRow({ title: 'Activity log', value: `${this.syncLog.length}`, navigates: true, icon: $r('app.media.ic_settings_log'), onTap: () => { this.setMeScreen('log'); } })
           }
           .width('100%')
           .borderRadius(16)
-          .backgroundColor($r('sys.color.comp_background_list_card'))
+          .backgroundColor(this.cardFill())
+
+          this.sectionHeader('Data')
+          Column() {
+            this.settingsRow({ title: 'Clear synced history', value: '', navigates: false, icon: $r('app.media.ic_settings_trash'), onTap: () => { this.confirmClearHistory(); } })
+          }
+          .width('100%')
+          .borderRadius(16)
+          .backgroundColor(this.cardFill())
         }
         .width('100%')
         // topInsetVp restored - meTab's Navigation is no longer shifted as
@@ -3147,12 +3622,12 @@ struct Index {
       .width('100%')
       .height('100%')
       .align(Alignment.Top)
-      .edgeEffect(EdgeEffect.Spring)
-      .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.START)))
+      .edgeEffect(EdgeEffect.Spring)      .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.START)))
       // Per Huawei's "如何实现沉浸式页面" FAQ - this Scroll's own background
       // draws behind the status bar instead of leaving a gap; the "Me"
       // title inside it stays clear via its own topInsetVp padding above.
       .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
@@ -3164,7 +3639,7 @@ struct Index {
   // mePageMap), so this is just the scrollable body.
   @Builder
   pairingScreenContent() {
-    Scroll() {
+    Scroll(this.pairingScroller) {
       Column({ space: 16 }) {
         Column({ space: 8 }) {
           Text('This screen open = pairable.').fontSize(13).fontWeight(FontWeight.Medium)
@@ -3175,7 +3650,7 @@ struct Index {
         .width('100%')
         .padding(16)
         .borderRadius(16)
-        .backgroundColor($r('sys.color.comp_background_list_card'))
+        .backgroundColor(this.cardFill())
         .alignItems(HorizontalAlign.Start)
 
         Column({ space: 12 }) {
@@ -3188,7 +3663,7 @@ struct Index {
               .borderRadius(16)
           }
           Text('Scan this on another device (with its own Pairing screen open) to find it.').fontSize(12).fontColor($r('sys.color.font_secondary'))
-          Button('Scan a Device\'s QR Code').fontSize(14).fontColor($r('app.color.brand_blue')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
+          Button('Scan a Device\'s QR Code').fontSize(14).fontColor(this.accent()).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
             .onClick(() => { tapHaptic(); void this.scanToPair(); })
           if (this.scanStatus.length > 0) {
             Text(this.scanStatus).fontSize(12).fontColor($r('sys.color.font_secondary'))
@@ -3197,7 +3672,7 @@ struct Index {
         .width('100%')
         .padding(16)
         .borderRadius(16)
-        .backgroundColor($r('sys.color.comp_background_list_card'))
+        .backgroundColor(this.cardFill())
 
         // Windows has no camera to scan the QR above with (see
         // TrustDeviceForm.cs) - this covers that, plus any cross-network
@@ -3217,7 +3692,7 @@ struct Index {
             .onChange((value: string) => { this.pairByAddressInput = value; })
           Button(this.pairingInProgress ? 'Connecting...' : 'Pair by Address')
             .fontSize(14)
-            .fontColor($r('app.color.brand_blue'))
+            .fontColor(this.accent())
             .backgroundColor($r('sys.color.comp_emphasize_secondary'))
             .systemMaterial(this.buttonMaterial())
             .enabled(!this.pairingInProgress)
@@ -3226,7 +3701,7 @@ struct Index {
         .width('100%')
         .padding(16)
         .borderRadius(16)
-        .backgroundColor($r('sys.color.comp_background_list_card'))
+        .backgroundColor(this.cardFill())
         .alignItems(HorizontalAlign.Start)
 
         Column({ space: 10 }) {
@@ -3234,19 +3709,19 @@ struct Index {
           Text('Copy this and send it to the other device (e.g. paste it into ITS Pair by Address field above) so it knows where to find this one.')
             .fontSize(12)
             .fontColor($r('sys.color.font_secondary'))
-          Button('Copy Pairing Info').fontSize(14).fontColor($r('app.color.brand_blue')).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
+          Button('Copy Pairing Info').fontSize(14).fontColor(this.accent()).backgroundColor($r('sys.color.comp_emphasize_secondary')).systemMaterial(this.buttonMaterial())
             .enabled(this.myPairingPayload.length > 0)
             .onClick(() => { tapHaptic(); void this.copyPairingPayload(); })
         }
         .width('100%')
         .padding(16)
         .borderRadius(16)
-        .backgroundColor($r('sys.color.comp_background_list_card'))
+        .backgroundColor(this.cardFill())
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
-      // topInsetVp + a fixed offset here: BarStyle.STACK floats the title
-      // bar over this content rather than reserving space for it, so this
+      // topInsetVp + a fixed offset here: the HDS title bar floats over
+      // this content rather than reserving space for it, so this
       // padding is what keeps the initial view starting below the bar
       // instead of hidden under it - scrolling still passes content
       // behind it afterward, which is the point of STACK over STANDARD.
@@ -3256,9 +3731,9 @@ struct Index {
     .width('100%')
     .height('100%')
     .align(Alignment.Top)
-    .edgeEffect(EdgeEffect.Spring)
-    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .edgeEffect(EdgeEffect.Spring)    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
     .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
@@ -3268,31 +3743,57 @@ struct Index {
   // subScreenDestination's .title() - see pairingScreenContent's comment.
   @Builder
   passcodeScreenContent() {
-    Scroll() {
+    Scroll(this.passcodeScroller) {
       Column({ space: 16 }) {
         Column({ space: 10 }) {
           Text('Devices entering the same passcode trust each other automatically.').fontSize(12).fontColor($r('sys.color.font_secondary'))
-          if (this.hasPassphrase) {
+          if (this.hasPassphrase && !this.passcodeChanging) {
             Text('Passcode is set on this device.').fontSize(13).fontColor($r('sys.color.confirm'))
+            // Change and Clear, as on Android. Clearing only stops this
+            // device proving the passcode to new devices - ones it already
+            // auto-trusted stay trusted.
+            Row({ space: 10 }) {
+              Button('Change Passcode')
+                .fontSize(14)
+                .fontColor(this.accent())
+                .backgroundColor($r('sys.color.comp_emphasize_secondary'))
+                .systemMaterial(this.buttonMaterial())
+                .onClick(() => { tapHaptic(); this.passphraseInput = ''; this.passcodeChanging = true; })
+              Button('Clear')
+                .fontSize(14)
+                .fontColor($r('sys.color.font_secondary'))
+                .backgroundColor($r('sys.color.comp_background_tertiary'))
+                .onClick(() => { tapHaptic(); void this.clearPassphrase(); })
+            }
           } else {
-            TextInput({ placeholder: 'Enter a shared passcode', text: this.passphraseInput })
+            TextInput({ placeholder: this.hasPassphrase ? 'Enter a new shared passcode' : 'Enter a shared passcode', text: this.passphraseInput })
               .type(InputType.Password)
               .fontSize(14)
               .enabled(!this.settingPassphrase)
               .onChange((value: string) => { this.passphraseInput = value; })
-            Button(this.settingPassphrase ? 'Setting...' : 'Set Passcode')
-              .fontSize(14)
-              .fontColor($r('app.color.brand_blue'))
-              .backgroundColor($r('sys.color.comp_emphasize_secondary'))
-              .systemMaterial(this.buttonMaterial())
-              .enabled(!this.settingPassphrase)
-              .onClick(() => { tapHaptic(); void this.setPassphrase(); })
+            Row({ space: 10 }) {
+              Button(this.settingPassphrase ? 'Setting...' : 'Set Passcode')
+                .fontSize(14)
+                .fontColor(this.accent())
+                .backgroundColor($r('sys.color.comp_emphasize_secondary'))
+                .systemMaterial(this.buttonMaterial())
+                .enabled(!this.settingPassphrase)
+                .onClick(() => { tapHaptic(); void this.setPassphrase(); })
+              if (this.passcodeChanging) {
+                Button('Cancel')
+                  .fontSize(14)
+                  .fontColor($r('sys.color.font_secondary'))
+                  .backgroundColor($r('sys.color.comp_background_tertiary'))
+                  .enabled(!this.settingPassphrase)
+                  .onClick(() => { tapHaptic(); this.passphraseInput = ''; this.passcodeChanging = false; })
+              }
+            }
           }
         }
         .width('100%')
         .padding(16)
         .borderRadius(16)
-        .backgroundColor($r('sys.color.comp_background_list_card'))
+        .backgroundColor(this.cardFill())
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
@@ -3303,9 +3804,9 @@ struct Index {
     .width('100%')
     .height('100%')
     .align(Alignment.Top)
-    .edgeEffect(EdgeEffect.Spring)
-    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .edgeEffect(EdgeEffect.Spring)    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
     .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
@@ -3320,7 +3821,7 @@ struct Index {
   // pairingScreenContent's comment.
   @Builder
   networkScreenContent() {
-    Scroll() {
+    Scroll(this.networkScroller) {
       Column({ space: 16 }) {
         Column({ space: 10 }) {
           Text('HarmonyOS can\'t detect this automatically - copy your tailnet IP from the Tailscale app and paste it here so other devices can reach this one off your local network.').fontSize(12).fontColor($r('sys.color.font_secondary'))
@@ -3331,7 +3832,7 @@ struct Index {
             .onChange((value: string) => { this.tailscaleIp = value; })
           Button(this.savingTailscaleIp ? 'Saving...' : 'Save')
             .fontSize(14)
-            .fontColor($r('app.color.brand_blue'))
+            .fontColor(this.accent())
             .backgroundColor($r('sys.color.comp_emphasize_secondary'))
             .systemMaterial(this.buttonMaterial())
             .enabled(!this.savingTailscaleIp)
@@ -3340,7 +3841,7 @@ struct Index {
         .width('100%')
         .padding(16)
         .borderRadius(16)
-        .backgroundColor($r('sys.color.comp_background_list_card'))
+        .backgroundColor(this.cardFill())
         .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
@@ -3351,9 +3852,9 @@ struct Index {
     .width('100%')
     .height('100%')
     .align(Alignment.Top)
-    .edgeEffect(EdgeEffect.Spring)
-    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .edgeEffect(EdgeEffect.Spring)    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
     .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
@@ -3361,16 +3862,16 @@ struct Index {
   // pairingScreenContent's comment.
   @Builder
   diagnosticsScreenContent() {
-    Scroll() {
+    Scroll(this.diagnosticsScroller) {
       Column({ space: 16 }) {
         Column() {
-          this.settingsRow('Run self-test', '', false, $r('app.media.ic_settings_diagnostics'), () => { void this.runSelfTest(); })
+          this.settingsRow({ title: 'Run self-test', value: '', navigates: false, icon: $r('app.media.ic_settings_diagnostics'), onTap: () => { void this.runSelfTest(); } })
           Divider().color($r('sys.color.comp_divider'))
-          this.settingsRow('Immersive material', this.immersiveSupported ? 'Supported' : 'Not supported', false, $r('app.media.ic_settings_diagnostics'), () => {})
+          this.settingsRow({ title: 'Immersive material', value: this.immersiveSupported ? 'Supported' : 'Not supported', navigates: false, icon: $r('app.media.ic_settings_diagnostics'), onTap: () => {} })
         }
         .width('100%')
         .borderRadius(16)
-        .backgroundColor($r('sys.color.comp_background_list_card'))
+        .backgroundColor(this.cardFill())
       }
       .width('100%')
       // No topInsetVp compensation - see pairingScreenContent's comment.
@@ -3380,9 +3881,9 @@ struct Index {
     .width('100%')
     .height('100%')
     .align(Alignment.Top)
-    .edgeEffect(EdgeEffect.Spring)
-    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .edgeEffect(EdgeEffect.Spring)    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
     .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
@@ -3392,7 +3893,7 @@ struct Index {
   // subScreenDestination's .title() - see pairingScreenContent's comment.
   @Builder
   activityLogScreenContent() {
-    Scroll() {
+    Scroll(this.logScroller) {
       Column({ space: 16 }) {
         if (this.syncLog.length === 0) {
           Text('Nothing logged yet.').fontSize(12).fontColor($r('sys.color.font_secondary'))
@@ -3405,7 +3906,7 @@ struct Index {
           .width('100%')
           .padding(16)
           .borderRadius(16)
-          .backgroundColor($r('sys.color.comp_background_list_card'))
+          .backgroundColor(this.cardFill())
           .alignItems(HorizontalAlign.Start)
         }
       }
@@ -3417,9 +3918,9 @@ struct Index {
     .width('100%')
     .height('100%')
     .align(Alignment.Top)
-    .edgeEffect(EdgeEffect.Spring)
-    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
+    .edgeEffect(EdgeEffect.Spring)    .transition(TransitionEffect.OPACITY.combine(TransitionEffect.move(TransitionEdge.END)))
     .backgroundColor($r('sys.color.background_secondary'))
+    .linearGradient(this.bottomGlow())
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
   }
 
@@ -3454,8 +3955,8 @@ struct Index {
       icon = $r('app.media.ic_tab_me_filled');
     }
     return BottomTabBarStyle.of(icon, text)
-      .labelStyle({ selectedColor: $r('app.color.brand_blue'), unselectedColor: $r('sys.color.font_secondary') })
-      .iconStyle({ selectedColor: $r('app.color.brand_blue'), unselectedColor: $r('sys.color.font_secondary') });
+      .labelStyle({ selectedColor: this.accent(), unselectedColor: $r('sys.color.font_secondary') })
+      .iconStyle({ selectedColor: this.accent(), unselectedColor: $r('sys.color.font_secondary') });
   }
 
   build() {
@@ -3497,7 +3998,7 @@ struct Index {
           style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
           applyShadow: false,
           interactive: true,
-          lightEffect: { color: $r('app.color.brand_blue') },
+          lightEffect: { color: this.accent() },
           colorInvert: true,
         }),
       })
