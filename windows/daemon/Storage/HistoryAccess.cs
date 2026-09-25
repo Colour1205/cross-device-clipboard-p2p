@@ -11,6 +11,13 @@ public class HistoryAccess
     private List<ClipboardEntry> inMemoryHistory = new List<ClipboardEntry>();
     private string history_path;
     private readonly FileStore fileStore;
+    // Written from every connection's read loop plus the clipboard watcher.
+    // Unlocked, two peers' history batches arriving together made two
+    // saveHistory calls collide on the file; the IOException escaped the
+    // message handler and ended that peer's connection with nothing logged.
+    // Serializing history for a batch while another thread trimmed it could
+    // also throw mid-enumeration.
+    private readonly object gate = new();
 
     public HistoryAccess(string label, FileStore fileStore)
     {
@@ -37,9 +44,10 @@ public class HistoryAccess
             inMemoryHistory = new List<ClipboardEntry>();
         }
     }
+    // A snapshot - safe to serialize or enumerate while other threads add.
     public List<ClipboardEntry> GetHistory()
     {
-        return inMemoryHistory;
+        lock (gate) { return inMemoryHistory.ToList(); }
     }
     /*
     merges history from peer into local history
@@ -47,14 +55,17 @@ public class HistoryAccess
     */
     public Boolean addToHistory(ClipboardEntry entry)
     {
-        if (inMemoryHistory.Contains(entry))
+        lock (gate)
         {
-            return false; // duplicate entry
+            if (inMemoryHistory.Contains(entry))
+            {
+                return false; // duplicate entry
+            }
+            inMemoryHistory.Add(entry);
+            TrimToLimit();
+            saveHistory();
+            return true;
         }
-        inMemoryHistory.Add(entry);
-        TrimToLimit();
-        saveHistory();
-        return true;
     }
 
     // Oldest-first eviction once we're over the cap. For a file entry, this
@@ -87,19 +98,25 @@ public class HistoryAccess
 
     public Boolean saveHistory()
     {
-        string json = System.Text.Json.JsonSerializer.Serialize(inMemoryHistory);
-        File.WriteAllText(history_path, json);
-        return true;
+        lock (gate)
+        {
+            string json = System.Text.Json.JsonSerializer.Serialize(inMemoryHistory);
+            File.WriteAllText(history_path, json);
+            return true;
+        }
     }
     public Boolean clearHistory()
     {
-        inMemoryHistory.Clear();
-        saveHistory();
-        return true;
+        lock (gate)
+        {
+            inMemoryHistory.Clear();
+            saveHistory();
+            return true;
+        }
     }
 
     public Boolean isEntryInHistory(ClipboardEntry entry)
     {
-        return inMemoryHistory.Contains(entry);
+        lock (gate) { return inMemoryHistory.Contains(entry); }
     }
 }

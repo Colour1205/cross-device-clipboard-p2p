@@ -12,6 +12,7 @@ public class PasscodeForm : Form
     public PasscodeForm()
     {
         Text = "Set Up Device Pairing";
+        Icon = AppIcon.Window;
         Width = 440;
         Height = 220;
         StartPosition = FormStartPosition.CenterScreen;

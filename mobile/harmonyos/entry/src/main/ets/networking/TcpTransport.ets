@@ -52,7 +52,13 @@ export class TcpServer {
 // just not fixing a Windows-side gap from the HarmonyOS side first.
 export async function connectTcp(address: string, port: number, timeoutMs: number = 5000): Promise<socket.TCPSocket> {
   const client = socket.constructTCPSocketInstance();
-  await client.connect({ address: { address, port }, timeout: timeoutMs });
+  try {
+    await client.connect({ address: { address, port }, timeout: timeoutMs });
+  } catch (e) {
+    // The caller never gets this socket, so nothing else would close it.
+    client.close().catch(() => { /* never opened - fine */ });
+    throw e as Error;
+  }
   // See TcpServer.start's matching comment - keeps an idle connection (and
   // any NAT mapping it depends on, e.g. over Tailscale) alive without
   // needing real traffic to flow.

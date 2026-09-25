@@ -41,7 +41,7 @@ import { FileStore } from '../storage/FileStore';
 import { FilePayload } from '../storage/FilePayload';
 import { Discovery, PeerBeacon } from '../networking/Discovery';
 import { TcpServer, connectTcp } from '../networking/TcpTransport';
-import { PeerConnection, TcpSocketAdapter, TcpSocketConnectionAdapter } from '../networking/PeerConnection';
+import { HandshakeReport, PeerConnection, PeerVerdict, TcpSocketAdapter, TcpSocketConnectionAdapter } from '../networking/PeerConnection';
 import { SyncManager } from '../networking/SyncManager';
 import { connection } from '@kit.NetworkKit';
 import { signEntry, ClipboardEntry } from '../crypto/Signing';
@@ -61,6 +61,11 @@ const base64Helper = new util.Base64Helper();
 // off-LAN reconnect attempt silently dials the wrong port and never
 // connects, with nothing in the log to say why.
 const TCP_PORT = 49000;
+// How long a pairing dial waits, after the handshake, to see whether the
+// other side kept the connection (Index's connectToAddress). Accepting
+// sends history straight away, and its first byte counts, so the full wait
+// normally means the other side is holding it as a pairing request.
+const PEER_VERDICT_WAIT_MS = 3000;
 
 // Visible via `hdc shell hilog` - unlike Windows's Console.WriteLine, this
 // app previously had NO console-visible debug output for its networking
@@ -142,6 +147,32 @@ interface SyncedItem {
 interface PairingInfo {
   PublicKey: string;
   Address?: string;
+}
+
+// How a dial to a peer ended (Index's connectToAddress):
+//   'unreachable'    - no TCP connection at all: the other device is off,
+//                      not on Tailscale / this network, or ClipLink isn't
+//                      listening there.
+//   'silent'         - it accepted the connection but never sent a
+//                      handshake (ClipLink there is stuck, or it's not
+//                      ClipLink on that port).
+//   'refused'        - it hung up around the handshake: it doesn't trust
+//                      this device, the passcodes differ (or it has none),
+//                      and its pairing screen isn't open - or it's busy
+//                      with another pairing request.
+//   'connected'      - already paired; now connected.
+//   'passcode'       - newly paired just now through matching passcodes.
+//   'prompt'         - a new pairing awaiting Accept on this device.
+//   'awaiting-other' - this device already trusts it, but it's holding the
+//                      connection as a pairing request of its own.
+//   'busy'           - this device is already showing another device's
+//                      pairing request, so this one was dropped.
+type DialOutcome = 'unreachable' | 'silent' | 'refused' | 'connected' | 'passcode' | 'prompt' | 'awaiting-other' | 'busy';
+
+interface DialResult {
+  // The address that got through, or every address tried if none did.
+  address: string;
+  outcome: DialOutcome;
 }
 
 // Passed to settingsSwitchRow as its ONLY argument, deliberately: ArkUI
@@ -878,6 +909,15 @@ struct Index {
   async acceptPairing(): Promise<void> {
     const conn = this.pendingPairingConn;
     if (conn === null) return;
+    if (conn.isClosed) {
+      // The other side rejected or gave up while this prompt was up.
+      // Trusting it anyway would pair this side only.
+      this.pendingPairingConn = null;
+      this.pendingPairingPeerId = '';
+      this.pendingPairingAddress = '';
+      promptAction.showToast({ message: 'The other device cancelled the pairing request - try again.' });
+      return;
+    }
     const context = getContext(this) as common.UIAbilityContext;
     const address = this.pendingPairingAddress.length > 0 ? this.pendingPairingAddress : undefined;
     await this.trustStore.trust(context, conn.peerDeviceId, address);
@@ -960,36 +1000,69 @@ struct Index {
       netLog(`  ${shortId}...: dialing ${device.address}:${TCP_PORT}`);
       this.connectingTo.add(device.publicKey);
       try {
-        const connected = await this.connectToAddress(device.address, TCP_PORT);
-        netLog(`  ${shortId}...: dial ${connected ? 'succeeded' : 'failed'}`);
+        const outcome = await this.connectToAddress(device.address, TCP_PORT);
+        netLog(`  ${shortId}...: dial ${outcome}`);
       } finally {
         this.connectingTo.delete(device.publicKey);
       }
     }
   }
 
-  // Returns whether a connection was actually established (not whether
-  // pairing succeeded - a pairing candidate still counts as "connected",
-  // the accept/reject decision happens separately via handleNewConnection).
-  // The periodic off-LAN reconnect loop ignores this; pairByAddress uses it
-  // to give the user visible feedback instead of failing silently.
-  private async connectToAddress(address: string, port: number): Promise<boolean> {
+  // How a dial ended (see DialOutcome). The periodic off-LAN reconnect loop
+  // only logs it; pairByAddress/scanToPair turn it into a message that says
+  // which step actually failed. forPairing also waits to see whether the
+  // other side kept the connection (see PeerConnection.waitForPeerVerdict):
+  // without that, a device that refused this one still looked like a
+  // success here, and the Pairing screen raised an Accept prompt for a
+  // connection that was already closed - accepting it wrote trust on this
+  // side only.
+  private async connectToAddress(address: string, port: number, forPairing: boolean = false): Promise<DialOutcome> {
+    let client: socket.TCPSocket;
     try {
-      const client = await connectTcp(address, port);
+      client = await connectTcp(address, port);
+    } catch (e) {
+      netLog(`connectToAddress ${address}:${port}: TCP connect failed - ${JSON.stringify(e)}`);
+      return 'unreachable';
+    }
+    try {
       const identity = new DeviceIdentity();
       const context = getContext(this) as common.UIAbilityContext;
-      const conn = await PeerConnection.create(new TcpSocketAdapter(client), identity, this.trustStore, context, this.pairingOpen, this.passphraseKeyStore);
+      const report = new HandshakeReport();
+      const conn = await PeerConnection.create(new TcpSocketAdapter(client), identity, this.trustStore, context, this.pairingOpen, this.passphraseKeyStore, report);
       if (conn === null) {
-        netLog(`connectToAddress ${address}:${port}: TCP connected but handshake returned null (peer refused - not trusted, and not in pairing mode / no matching passphrase)`);
+        netLog(`connectToAddress ${address}:${port}: TCP connected but no usable handshake (${report.timedOut ? 'no answer' : 'peer closed, or refused locally'})`);
         client.close().catch(() => { /* already closed - fine */ });
-        return false;
+        return report.timedOut ? 'silent' : 'refused';
+      }
+      let verdict: PeerVerdict | null = null;
+      if (forPairing) {
+        verdict = await conn.waitForPeerVerdict(PEER_VERDICT_WAIT_MS);
+        netLog(`connectToAddress ${address}:${port}: peer verdict ${verdict}`);
+        if (verdict === 'closed') {
+          conn.close();
+          // Closed because it's already holding a request from this same
+          // device (e.g. its own beacon-triggered dial got there first) -
+          // and that request is the Accept prompt showing here right now.
+          const pending: PeerConnection | null = this.pendingPairingConn;
+          if (pending !== null && pending.peerDeviceId === conn.peerDeviceId) return 'prompt';
+          return 'refused';
+        }
       }
       netLog(`connectToAddress ${address}:${port}: handshake succeeded, peer=${conn.peerDeviceId.slice(0, 16)}... wasAlreadyTrusted=${conn.wasAlreadyTrusted}`);
       this.handleNewConnection(conn, address);
-      return true;
+      if (!conn.wasAlreadyTrusted) {
+        // handleNewConnection drops a second candidate while another
+        // device's request is still showing.
+        return this.pendingPairingConn === conn ? 'prompt' : 'busy';
+      }
+      if (conn.newlyTrustedViaPassphrase) return 'passcode';
+      // Trusted here but silent there: it's holding this as a pairing
+      // request, not using it as a connection.
+      return verdict === 'quiet' ? 'awaiting-other' : 'connected';
     } catch (e) {
-      netLog(`connectToAddress ${address}:${port}: TCP connect failed - ${JSON.stringify(e)}`);
-      return false;
+      netLog(`connectToAddress ${address}:${port}: handshake threw - ${JSON.stringify(e)}`);
+      client.close().catch(() => { /* already closed - fine */ });
+      return 'refused';
     }
   }
 
@@ -1238,13 +1311,45 @@ struct Index {
     return candidates;
   }
 
-  // Tries each candidate in order, returning the first that connects.
-  private async connectToFirstReachable(candidates: string[], port: number): Promise<string | null> {
+  // Tries each candidate in order, stopping at the first that completes a
+  // handshake. If none does, report the most informative failure: a
+  // refusal (ClipLink answered) over silence (something answered) over
+  // unreachable.
+  private async connectToFirstReachable(candidates: string[], port: number): Promise<DialResult> {
+    let outcome: DialOutcome = 'unreachable';
     for (const addr of candidates) {
-      const connected = await this.connectToAddress(addr, port);
-      if (connected) return addr;
+      const tried = await this.connectToAddress(addr, port, true);
+      if (tried !== 'unreachable' && tried !== 'refused' && tried !== 'silent') {
+        return { address: addr, outcome: tried };
+      }
+      if (tried === 'refused' || (tried === 'silent' && outcome === 'unreachable')) outcome = tried;
     }
-    return null;
+    return { address: candidates.join(' or '), outcome: outcome };
+  }
+
+  // The pairing screen's feedback for a dial. It used to be one message
+  // for every failure - "make sure the other device's Pairing screen is
+  // open" - which was misleading whenever the real problem was the network
+  // (or the other device not listening), and ignored the passcode path.
+  private pairingOutcomeMessage(result: DialResult): string {
+    switch (result.outcome) {
+      case 'connected':
+        return `Already paired with ${result.address} - connected.`;
+      case 'passcode':
+        return `Paired with ${result.address} using your passcode.`;
+      case 'prompt':
+        return `Reached ${result.address} - accept the pairing prompt on both devices to finish.`;
+      case 'awaiting-other':
+        return `Reached ${result.address} - accept the request on that device to finish.`;
+      case 'busy':
+        return 'Another pairing request is already waiting here - accept or reject it first.';
+      case 'refused':
+        return `${result.address} answered but didn't accept this device. Set the same passcode on both, or open its Pairing screen (and finish any other pairing request there), then try again.`;
+      case 'silent':
+        return `${result.address} accepted the connection but ClipLink there didn't respond - try restarting it on that device.`;
+      default:
+        return `Couldn't connect to ${result.address}. Check ClipLink is running there and both devices are on Tailscale (or the same network).`;
+    }
   }
 
   async scanToPair(): Promise<void> {
@@ -1270,10 +1375,8 @@ struct Index {
       }
       const candidates = this.addressCandidatesFor(publicKey, address);
       this.scanStatus = `Connecting to ${candidates[0]}...`;
-      const reached = await this.connectToFirstReachable(candidates, TCP_PORT);
-      this.scanStatus = reached !== null
-        ? `Reached ${reached} - accept the pairing prompt on both devices to finish.`
-        : `Could not reach ${candidates.join(' or ')} - make sure the other device's Pairing screen is open too.`;
+      const dial = await this.connectToFirstReachable(candidates, TCP_PORT);
+      this.scanStatus = this.pairingOutcomeMessage(dial);
     } catch (e) {
       const be = e as BusinessError;
       if (be.code === 1000500002) {
@@ -1314,13 +1417,8 @@ struct Index {
       // Same LAN-first ordering as scanToPair - pasted pairing text carries
       // the peer's advertised (often Tailscale) address too.
       const candidates = this.addressCandidatesFor(pastedKey, address);
-      const reached = await this.connectToFirstReachable(candidates, TCP_PORT);
-      promptAction.showToast({
-        message: reached !== null
-          ? `Reached ${reached} - accept the pairing prompt on both devices to finish.`
-          : `Could not reach ${candidates.join(' or ')} - make sure the other device's Pairing screen is open too.`,
-        duration: 3000,
-      });
+      const result = await this.connectToFirstReachable(candidates, TCP_PORT);
+      promptAction.showToast({ message: this.pairingOutcomeMessage(result), duration: 3500 });
     } finally {
       this.pairingInProgress = false;
     }

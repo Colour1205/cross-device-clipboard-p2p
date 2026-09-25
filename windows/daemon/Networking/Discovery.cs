@@ -38,13 +38,38 @@ public class Discovery
         client.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         client.Client.Bind(new System.Net.IPEndPoint(IPAddress.Any, PORT));
 
+        // Both loops catch per iteration. Before, one exception ended a loop
+        // for the rest of the daemon's life with nothing logged: a single
+        // send failure (no network for a moment - Wi-Fi switching, VPN
+        // reconnecting, waking from sleep) stopped this PC's beacons, and a
+        // single stray datagram on this port with a non-numeric first field
+        // stopped it hearing anyone else's. Either way, LAN discovery quietly
+        // died while everything else looked fine.
         Task sendTask = Task.Run(async () =>
         {
+            bool failing = false;
             while (true)
             {
-                string? proof = getProof?.Invoke();
-                string pairing = (getPairingOpen?.Invoke() ?? false) ? "1" : "-";
-                await Send(client, $"{tcpPort}:{deviceID}:{proof ?? "-"}:{ownAddress ?? "-"}:{pairing}");
+                try
+                {
+                    string? proof = getProof?.Invoke();
+                    string pairing = (getPairingOpen?.Invoke() ?? false) ? "1" : "-";
+                    await Send(client, $"{tcpPort}:{deviceID}:{proof ?? "-"}:{ownAddress ?? "-"}:{pairing}");
+                    if (failing)
+                    {
+                        Console.WriteLine("[discovery] beacons sending again");
+                        failing = false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Logged once per outage, not every 2s while offline.
+                    if (!failing)
+                    {
+                        Console.WriteLine($"[discovery] beacon send failed, retrying: {ex.Message}");
+                        failing = true;
+                    }
+                }
                 await Task.Delay(2000);
             }
         });
@@ -53,19 +78,30 @@ public class Discovery
         {
             while (true)
             {
-                var result = await Receive(client);
-                string message = result.message;
-                IPAddress sender = result.sender;
-                string[] parts = message.Split(':');
-                if (parts.Length < 3) continue; // malformed/old-format beacon, ignore
+                try
+                {
+                    var result = await Receive(client);
+                    string message = result.message;
+                    IPAddress sender = result.sender;
+                    string[] parts = message.Split(':');
+                    if (parts.Length < 3) continue; // malformed/old-format beacon, ignore
+                    if (!int.TryParse(parts[0], out int other_port)) continue; // not a beacon
 
-                int other_port = int.Parse(parts[0]);
-                string other_device_id = parts[1];
-                string? receivedProof = parts[2] == "-" ? null : parts[2];
-                string? receivedAddress = parts.Length > 3 && parts[3] != "-" ? parts[3] : null;
-                bool receivedPairing = parts.Length > 4 && parts[4] == "1";
+                    string other_device_id = parts[1];
+                    string? receivedProof = parts[2] == "-" ? null : parts[2];
+                    string? receivedAddress = parts.Length > 3 && parts[3] != "-" ? parts[3] : null;
+                    bool receivedPairing = parts.Length > 4 && parts[4] == "1";
 
-                PeerDiscovered?.Invoke(other_device_id, sender, other_port, receivedProof, receivedAddress, receivedPairing);
+                    PeerDiscovered?.Invoke(other_device_id, sender, other_port, receivedProof, receivedAddress, receivedPairing);
+                }
+                catch (Exception ex)
+                {
+                    // e.g. a SocketException from an ICMP "port unreachable"
+                    // bounced back at this UDP socket. Brief pause so a
+                    // persistent error can't spin.
+                    Console.WriteLine($"[discovery] receive failed, still listening: {ex.Message}");
+                    await Task.Delay(200);
+                }
             }
         });
 

@@ -25,9 +25,22 @@ public class IpcServer
     {
         while (true)
         {
-            using var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
-            await pipe.WaitForConnectionAsync();
-            await HandleClient(pipe);
+            // Creating the pipe or waiting on it can throw (a second daemon
+            // with the same label holding the pipe, or a tray client closing
+            // before the connection completes). Uncaught, that ended this
+            // loop and the tray reported the daemon as unreachable while it
+            // was still running.
+            try
+            {
+                using var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                await pipe.WaitForConnectionAsync();
+                await HandleClient(pipe);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ipc] pipe error, still serving: {ex.Message}");
+                await Task.Delay(500);
+            }
         }
     }
 

@@ -7,6 +7,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>ClipboardDaemon</RootNamespace>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>..\ClipLink.ico</ApplicationIcon>
   </PropertyGroup>
 
 </Project>

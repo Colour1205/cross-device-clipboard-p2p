@@ -45,7 +45,10 @@ public class PassphraseKeyStore
 
     public void SetPassphrase(string passphrase)
     {
-        key = PassphraseAuth.DeriveKey(passphrase, FixedSalt);
+        // Trimmed like HarmonyOS does - a stray leading/trailing space on
+        // only one device derives a different key, and passcode pairing then
+        // fails with nothing to show why.
+        key = PassphraseAuth.DeriveKey(passphrase.Trim(), FixedSalt);
         // DPAPI-encrypted at rest, tied to this Windows user — see DeviceIdentity
         // for the same treatment of the identity private key.
         byte[] protectedBytes = System.Security.Cryptography.ProtectedData.Protect(key, null, System.Security.Cryptography.DataProtectionScope.CurrentUser);

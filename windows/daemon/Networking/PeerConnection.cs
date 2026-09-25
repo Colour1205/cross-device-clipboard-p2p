@@ -189,7 +189,13 @@ public class PeerConnection
                 MessageReceived?.Invoke(decrypted);
             }
         }
-        catch (Exception) { } // abrupt disconnect, or a corrupt/forged line that failed to decrypt
+        catch (Exception ex)
+        {
+            // Abrupt disconnect, or a corrupt/forged line that failed to
+            // decrypt. Logged so a connection that ends for a reason other
+            // than the peer going away doesn't just silently vanish.
+            Console.WriteLine($"[conn] read loop for {PeerDeviceId[..Math.Min(12, PeerDeviceId.Length)]}... ended: {ex.GetType().Name}: {ex.Message}");
+        }
         finally
         {
             StopHeartbeat();

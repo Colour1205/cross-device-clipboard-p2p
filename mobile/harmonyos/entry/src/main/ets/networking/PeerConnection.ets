@@ -34,6 +34,25 @@ interface HandshakeMessage {
   PassphraseProof?: string;
 }
 
+// What the other side did right after a completed handshake - see
+// PeerConnection.waitForPeerVerdict.
+export type PeerVerdict = 'accepted' | 'closed' | 'quiet';
+
+// Optional out-parameter for PeerConnection.create, for callers that need to
+// tell a peer that never answered apart from one that hung up.
+export class HandshakeReport {
+  // The connection stayed open but no handshake arrived within
+  // HANDSHAKE_TIMEOUT_MS.
+  timedOut: boolean = false;
+}
+
+// How long to wait for the peer's half of the handshake. Without a limit, a
+// peer that accepts the TCP connection but never answers (a wedged daemon,
+// or not ClipLink at all) left the dial - and the Pairing screen's
+// "Connecting..." - hanging forever. Generous for a cold Tailscale relay.
+// Handshake only; nothing to do with the heartbeat below.
+const HANDSHAKE_TIMEOUT_MS = 10000;
+
 // Both socket.TCPSocket (outbound, from connectTcp) and
 // socket.TCPSocketConnection (inbound, from TcpServer.onConnection) expose
 // this same shape - captured explicitly here rather than relying on
@@ -107,6 +126,9 @@ class TcpLineChannel {
   private buffer: Uint8Array = new Uint8Array(0);
   private pendingLines: string[] = [];
   private waiters: Array<(line: string | null) => void> = [];
+  // Notified whenever a line arrives or the socket closes - see
+  // waitForActivity.
+  private activityListeners: Array<() => void> = [];
   private closed = false;
   // Chains every writeLine onto the previous one so only one client.send()
   // is ever in flight at a time - without this, the heartbeat's own
@@ -125,6 +147,7 @@ class TcpLineChannel {
     client.onClose(() => {
       this.closed = true;
       this.flushWaiters(null);
+      this.notifyActivity();
     });
   }
 
@@ -134,6 +157,10 @@ class TcpLineChannel {
     combined.set(this.buffer, 0);
     combined.set(bytes, this.buffer.length);
     this.buffer = combined;
+    // Before splitting into lines: for waitForActivity, a partial line is
+    // already proof the peer is talking (a big first message can take
+    // seconds to arrive in full over a relayed connection).
+    this.notifyActivity();
 
     let idx = this.buffer.indexOf(10); // '\n'
     while (idx !== -1) {
@@ -153,12 +180,19 @@ class TcpLineChannel {
     } else {
       this.pendingLines.push(line);
     }
+    this.notifyActivity();
   }
 
   private flushWaiters(value: string | null): void {
     while (this.waiters.length > 0) {
       this.waiters.shift()?.(value);
     }
+  }
+
+  private notifyActivity(): void {
+    const listeners = this.activityListeners;
+    this.activityListeners = [];
+    for (const listener of listeners) listener();
   }
 
   async readLine(): Promise<string | null> {
@@ -168,6 +202,67 @@ class TcpLineChannel {
     if (this.closed) return null;
     return new Promise<string | null>((resolve) => {
       this.waiters.push(resolve);
+    });
+  }
+
+  // readLine with a deadline: null on close OR on timeout. The timed-out
+  // waiter is removed so it can't swallow a line that arrives later.
+  async readLineWithin(timeoutMs: number): Promise<string | null> {
+    if (this.pendingLines.length > 0) {
+      return this.pendingLines.shift()!;
+    }
+    if (this.closed) return null;
+    return new Promise<string | null>((resolve) => {
+      let timerId = -1;
+      const waiter = (line: string | null): void => {
+        clearTimeout(timerId);
+        resolve(line);
+      };
+      timerId = setTimeout(() => {
+        const i = this.waiters.indexOf(waiter);
+        if (i !== -1) this.waiters.splice(i, 1);
+        resolve(null);
+      }, timeoutMs);
+      this.waiters.push(waiter);
+    });
+  }
+
+  get isClosed(): boolean {
+    return this.closed;
+  }
+
+  // Without consuming anything: 'accepted' once any data has arrived (whole
+  // lines stay queued for readLine), 'closed' if the socket closes first,
+  // 'quiet' if neither happens within timeoutMs. Only meaningful before
+  // anything reads the channel (i.e. before PeerConnection.listen).
+  waitForActivity(timeoutMs: number): Promise<PeerVerdict> {
+    return new Promise<PeerVerdict>((resolve) => {
+      let timerId = -1;
+      const settled = (): boolean => {
+        if (this.pendingLines.length > 0 || this.buffer.length > 0) {
+          resolve('accepted');
+          return true;
+        }
+        if (this.closed) {
+          resolve('closed');
+          return true;
+        }
+        return false;
+      };
+      if (settled()) return;
+      const onActivity = (): void => {
+        if (settled()) {
+          clearTimeout(timerId);
+        } else {
+          this.activityListeners.push(onActivity);
+        }
+      };
+      this.activityListeners.push(onActivity);
+      timerId = setTimeout(() => {
+        const i = this.activityListeners.indexOf(onActivity);
+        if (i !== -1) this.activityListeners.splice(i, 1);
+        resolve('quiet');
+      }, timeoutMs);
     });
   }
 
@@ -259,7 +354,7 @@ export class PeerConnection {
   // Returns null (never throws for a bad/malformed peer, or an untrusted
   // one that's neither pairing-mode-eligible nor passphrase-verified) on
   // any handshake failure - same contract as PeerConnection.cs's CreateAsync.
-  static async create(client: TcpLike, myIdentity: DeviceIdentity, trustStore: TrustStore, context: common.UIAbilityContext, pairingModeOpen: boolean, passphraseKeyStore: PassphraseKeyStore): Promise<PeerConnection | null> {
+  static async create(client: TcpLike, myIdentity: DeviceIdentity, trustStore: TrustStore, context: common.UIAbilityContext, pairingModeOpen: boolean, passphraseKeyStore: PassphraseKeyStore, report?: HandshakeReport): Promise<PeerConnection | null> {
     const channel = new TcpLineChannel(client);
 
     try {
@@ -280,8 +375,11 @@ export class PeerConnection {
       };
       await channel.writeLine(JSON.stringify(myHandshake));
 
-      const theirLine = await channel.readLine();
-      if (theirLine === null) return null;
+      const theirLine = await channel.readLineWithin(HANDSHAKE_TIMEOUT_MS);
+      if (theirLine === null) {
+        if (report !== undefined && !channel.isClosed) report.timedOut = true;
+        return null;
+      }
 
       let theirHandshake: HandshakeMessage;
       try {
@@ -340,6 +438,23 @@ export class PeerConnection {
 
   onDisconnected(callback: () => void): void {
     this.disconnectedCallback = callback;
+  }
+
+  // Call BEFORE listen(), after dialling someone to pair. Both sides send
+  // their half of the handshake before deciding whether to accept the
+  // other, so a peer that refuses this device still completes the
+  // handshake from here - its refusal only shows up as the socket closing
+  // just after. Every client sends its history the moment it accepts a
+  // link, so: 'accepted' = a line arrived, 'closed' = refused, 'quiet' =
+  // it's holding the connection as a pairing request awaiting Accept.
+  waitForPeerVerdict(timeoutMs: number): Promise<PeerVerdict> {
+    return this.channel.waitForActivity(timeoutMs);
+  }
+
+  // The socket has closed - e.g. a held pairing request whose other side
+  // rejected or gave up while this side's Accept prompt was still showing.
+  get isClosed(): boolean {
+    return this.channel.isClosed;
   }
 
   // Starts the read loop - fire-and-forget, matches PeerConnection.cs's

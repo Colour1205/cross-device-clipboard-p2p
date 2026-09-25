@@ -359,8 +359,34 @@ class Program
         connectionsByDeviceId.TryGetValue(conn.PeerDeviceId, out var previous);
         connectionsByDeviceId[conn.PeerDeviceId] = conn;
         Console.WriteLine($"[conn] connected: {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}... ({connectionsByDeviceId.Count} total)");
-        SendHistoryBatch(conn, historyAccess);
-        conn.MessageReceived += msg => HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+        try
+        {
+            SendHistoryBatch(conn, historyAccess);
+        }
+        catch (Exception ex)
+        {
+            // Must not stop the rest of this setup: the connection is already
+            // in the map, and without its Disconnected handler and Listen()
+            // below it would sit there dead but "connected" forever, and
+            // nothing would ever redial this peer.
+            Console.WriteLine($"[conn] couldn't send history to {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}...: {ex.Message}");
+        }
+        conn.MessageReceived += msg =>
+        {
+            // One bad message is skipped, not fatal. An exception escaping
+            // here used to end the whole connection with nothing logged (it
+            // unwinds PeerConnection.Listen's read loop) - e.g. two peers'
+            // history batches saving at once, or a malformed file message -
+            // which looked like the connection randomly dropping.
+            try
+            {
+                HandleMessage(msg, conn, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[conn] error handling a message from {conn.PeerDeviceId[..Math.Min(12, conn.PeerDeviceId.Length)]}... (connection kept): {ex.GetType().Name}: {ex.Message}");
+            }
+        };
         conn.Disconnected += () =>
         {
             // Identity-checked removal, NOT TryRemove(key). When both ends
@@ -484,7 +510,23 @@ class Program
         await client.ConnectAsync(address, port, cancellationToken);
         EnableKeepAlive(client);
 
-        var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore, pairingState.ModeOpen, passphraseKeyStore);
+        PeerConnection? conn;
+        try
+        {
+            // The token above only covers connecting. Without a timeout here
+            // too, a peer that accepts TCP but never answers (a frozen app
+            // whose OS still holds the socket open) stalled the off-LAN
+            // reconnect loop's Task.WhenAll - so no other peer was retried -
+            // and kept this peer reserved in connectingTo, blocking beacon
+            // dials to it as well.
+            conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore, pairingState.ModeOpen, passphraseKeyStore)
+                .WaitAsync(HandshakeTimeout);
+        }
+        catch
+        {
+            client.Close();
+            throw;
+        }
         if (conn == null)
         {
             client.Close();
@@ -515,6 +557,58 @@ class Program
         HandleNewConnection(conn, address, pairingState, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
     }
 
+    // Long enough for a first packet over a cold Tailscale relay (DERP), short
+    // enough that a peer which connects and never sends its handshake doesn't
+    // hold a socket open indefinitely.
+    private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(15);
+
+    // One incoming connection, from the TCP accept loop in Main. Everything
+    // is caught here: nothing a single peer does may take the listener down.
+    private static async Task AcceptConnection(
+        TcpClient client,
+        DeviceIdentity myIdentity,
+        PairingState pairingState,
+        PassphraseKeyStore passphraseKeyStore,
+        ConcurrentDictionary<string, PeerConnection> connectionsByDeviceId,
+        ClipboardSync clipboardSync,
+        HistoryAccess historyAccess,
+        TrustStore trustStore,
+        FileStore fileStore,
+        FileTransferState fileTransferState)
+    {
+        string? remoteAddress = null;
+        try
+        {
+            EnableKeepAlive(client);
+            // Without capturing this, a device that only ever DIALED OUT
+            // to pair (rather than being dialed) would never learn an
+            // address for whoever just connected to it - meaning it could
+            // never later reconnect off-LAN on its own (see the off-LAN
+            // reconnect loop below), only ever be reconnected TO.
+            remoteAddress = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString();
+
+            var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore, pairingState.ModeOpen, passphraseKeyStore)
+                .WaitAsync(HandshakeTimeout);
+            if (conn == null)
+            {
+                // handshake failed, or whoever connected isn't in our trust
+                // store and we're not expecting to pair right now — refuse at
+                // the connection level, not just per-message
+                Console.WriteLine($"[listen] handshake from {remoteAddress} rejected or incomplete (not trusted with no matching passcode and the pairing window closed, or it disconnected / sent a bad handshake)");
+                client.Close();
+                return;
+            }
+
+            HandleNewConnection(conn, remoteAddress, pairingState, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+        }
+        catch (Exception ex)
+        {
+            // Closing the socket also ends a handshake that timed out above.
+            Console.WriteLine($"[listen] connection from {remoteAddress ?? "unknown"} dropped during handshake: {ex.GetType().Name}: {ex.Message}");
+            client.Close();
+        }
+    }
+
     // Counterpart to ConnectToPeer for a genuinely new pairing target - the
     // peer's identity isn't known in advance (that's what the handshake is
     // for), so there's no id to validate against. Used by the "pair_by_address"
@@ -535,12 +629,14 @@ class Program
         FileStore fileStore,
         FileTransferState fileTransferState)
     {
+        TcpClient client = new TcpClient();
         try
         {
-            TcpClient client = new TcpClient();
             await client.ConnectAsync(address, port);
             EnableKeepAlive(client);
-            var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore, pairingState.ModeOpen, passphraseKeyStore);
+            // Same reason as ConnectToPeer's timeout.
+            var conn = await PeerConnection.CreateAsync(client, myIdentity, trustStore, pairingState.ModeOpen, passphraseKeyStore)
+                .WaitAsync(HandshakeTimeout);
             if (conn == null)
             {
                 client.Close();
@@ -551,6 +647,7 @@ class Program
         }
         catch (Exception)
         {
+            client.Close();
             return false; // not reachable right now
         }
     }
@@ -670,6 +767,14 @@ class Program
                 // PeerConnection.CreateAsync accept a handshake from an untrusted
                 // peer at all (see its own doc comment).
                 pairingState.ModeOpen = request.Payload == "1";
+                if (!pairingState.ModeOpen)
+                {
+                    // Closing the Pairing dialog abandons any request it was
+                    // showing. Left pending, it blocked every later attempt
+                    // (TrySetPending refuses while one is held), and the held
+                    // socket is never read, so its peer dying went unnoticed.
+                    pairingState.RejectPending();
+                }
                 return new IpcResponse(true, pairingState.ModeOpen.ToString());
             }
             else if (request.Command == "get_pending_pairing")
@@ -797,32 +902,46 @@ class Program
 
 
         /* receiving connections */
+        // Started here, not inside the Task.Run below: a failure to bind (the
+        // port already taken - e.g. a second daemon on the same port) used to
+        // throw inside that unobserved task, leaving a daemon that looked
+        // fine but could never be dialled. Now it stops with a clear reason.
+        TcpListener tcpListener = new TcpListener(IPAddress.Any, int.Parse(port));
+        try
+        {
+            tcpListener.Start();
+        }
+        catch (SocketException ex)
+        {
+            Console.WriteLine($"[listen] FATAL: can't listen on TCP port {port} ({ex.SocketErrorCode}: {ex.Message}). Is another ClipboardDaemon already running?");
+            Environment.Exit(1);
+        }
         Task.Run(async () =>
         {
-            TcpListener tcpListener = new TcpListener(IPAddress.Any, int.Parse(port));
-            tcpListener.Start();
             while (true)
             {
-                var client = await tcpListener.AcceptTcpClientAsync();
-                EnableKeepAlive(client);
-                // Without capturing this, a device that only ever DIALED OUT
-                // to pair (rather than being dialed) would never learn an
-                // address for whoever just connected to it - meaning it could
-                // never later reconnect off-LAN on its own (see the off-LAN
-                // reconnect loop below), only ever be reconnected TO.
-                string? remoteAddress = (client.Client.RemoteEndPoint as IPEndPoint)?.Address.ToString();
-
-                var conn = await PeerConnection.CreateAsync(client, identity, trustStore, pairingState.ModeOpen, passphraseKeyStore);
-                if (conn == null)
+                TcpClient client;
+                try
                 {
-                    // handshake failed, or whoever connected isn't in our trust
-                    // store and we're not expecting to pair right now — refuse at
-                    // the connection level, not just per-message
-                    client.Close();
+                    client = await tcpListener.AcceptTcpClientAsync();
+                }
+                catch (Exception ex) when (ex is SocketException or IOException)
+                {
+                    Console.WriteLine($"[listen] accept failed, still listening: {ex.Message}");
+                    await Task.Delay(200); // a persistent error can't spin
                     continue;
                 }
-
-                HandleNewConnection(conn, remoteAddress, pairingState, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+                // Each connection is handled off the accept loop. Awaiting the
+                // handshake here meant any exception in it (a peer resetting
+                // mid-handshake throws IOException, which CreateAsync doesn't
+                // catch) escaped this fire-and-forget task and silently ended
+                // the loop - the listener was then gone for the rest of the
+                // daemon's life. Nothing could dial in any more: on the LAN
+                // that went unnoticed because this side dials out on beacons,
+                // but over Tailscale (no beacons) every pairing and reconnect
+                // failed. It also meant one slow handshake blocked every other
+                // incoming connection until it finished.
+                _ = Task.Run(() => AcceptConnection(client, identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState));
             }
 
         });
@@ -834,56 +953,70 @@ class Program
 
         discovery.PeerDiscovered += async (other_device_id, sender, other_port, proof, peerAddress, otherPairingOpen) =>
         {
-            // auto-trust: if this device wasn't already trusted, but it proved
-            // knowledge of the same passphrase we have configured, trust it now —
-            // an alternative to manual QR/key pairing for "these are all my own devices".
-            // Excludes our own id: UDP broadcasts loop back to the sender on
-            // localhost, so without this check a device would "auto-trust" itself.
-            if (other_device_id != identity.GetPublicKey()
-                && !trustStore.IsTrusted(other_device_id) && proof != null && passphraseKeyStore.HasPassphrase
-                && PassphraseAuth.VerifyProof(passphraseKeyStore.GetKey()!, other_device_id, proof))
+            // This handler is async void: an exception escaping it doesn't
+            // just end the handler, it crashes the whole daemon.
+            try
             {
-                Console.WriteLine($"Auto-trusting {other_device_id} — proved knowledge of shared passphrase");
-                trustStore.Trust(other_device_id, peerAddress);
+                // auto-trust: if this device wasn't already trusted, but it proved
+                // knowledge of the same passphrase we have configured, trust it now —
+                // an alternative to manual QR/key pairing for "these are all my own devices".
+                // Excludes our own id: UDP broadcasts loop back to the sender on
+                // localhost, so without this check a device would "auto-trust" itself.
+                if (other_device_id != identity.GetPublicKey()
+                    && !trustStore.IsTrusted(other_device_id) && proof != null && passphraseKeyStore.HasPassphrase
+                    && PassphraseAuth.VerifyProof(passphraseKeyStore.GetKey()!, other_device_id, proof))
+                {
+                    Console.WriteLine($"Auto-trusting {other_device_id} — proved knowledge of shared passphrase");
+                    trustStore.Trust(other_device_id, peerAddress);
+                }
+
+                bool isTrusted = trustStore.IsTrusted(other_device_id);
+
+                // connect only when the other device's public key is "smaller" than this device's public key (to avoid duplicate connections)
+                // connect only if the other device is in the trust store
+                // CompareOrdinal, not CompareTo: CompareTo is culture-sensitive
+                // (it sorts 'a' before 'B'), while HarmonyOS and Android compare
+                // keys by character code ('B' before 'a'). For keys that first
+                // differ in letter case the two sides disagreed about who dials,
+                // so after an off-LAN (Tailscale) pairing neither side would
+                // reconnect - or both would.
+                if (!connectionsByDeviceId.ContainsKey(other_device_id) && string.CompareOrdinal(other_device_id, identity.GetPublicKey()) < 0
+                    && isTrusted && connectingTo.TryAdd(other_device_id, 0))
+                {
+                    Console.WriteLine($"Discovered peer {other_device_id} at {other_port}");
+                    try
+                    {
+                        await ConnectToPeer(other_device_id, sender.ToString(), other_port, identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+                    }
+                    catch (Exception)
+                    {
+                        // peer wasn't actually reachable — ignore, we'll hear its next beacon
+                    }
+                    finally
+                    {
+                        connectingTo.TryRemove(other_device_id, out _);
+                    }
+                }
+                // Sibling path for UNTRUSTED peers - only attempts a handshake at
+                // all when BOTH this device's own pairing mode is open
+                // (pairingState.ModeOpen) AND the beacon says the sender's is too
+                // (otherPairingOpen) - two independent, live, local "I'm expecting
+                // to pair right now" signals, not just one side's assumption. Same
+                // tie-breaker as above so both sides don't dial each other
+                // simultaneously; the handshake that results is what actually
+                // surfaces the accept/reject prompt (see HandleNewConnection).
+                else if (pairingState.ModeOpen && otherPairingOpen && !isTrusted
+                    && !connectionsByDeviceId.ContainsKey(other_device_id) && string.CompareOrdinal(other_device_id, identity.GetPublicKey()) < 0
+                    && pairingState.PendingPeerId == null)
+                {
+                    Console.WriteLine($"Discovered pairing candidate {other_device_id} at {other_port}");
+                    await PairByAddress(sender.ToString(), other_port, identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
+                }
             }
-
-            bool isTrusted = trustStore.IsTrusted(other_device_id);
-
-            // connect only when the other device's public key is "smaller" than this device's public key (to avoid duplicate connections)
-            // connect only if the other device is in the trust store
-            if (!connectionsByDeviceId.ContainsKey(other_device_id) && other_device_id.CompareTo(identity.GetPublicKey()) < 0
-            && isTrusted && connectingTo.TryAdd(other_device_id, 0))
+            catch (Exception ex)
             {
-                Console.WriteLine($"Discovered peer {other_device_id} at {other_port}");
-                try
-                {
-                    await ConnectToPeer(other_device_id, sender.ToString(), other_port, identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
-                }
-                catch (Exception)
-                {
-                    // peer wasn't actually reachable — ignore, we'll hear its next beacon
-                }
-                finally
-                {
-                    connectingTo.TryRemove(other_device_id, out _);
-                }
+                Console.WriteLine($"[discovery] error handling beacon from {sender}: {ex.GetType().Name}: {ex.Message}");
             }
-            // Sibling path for UNTRUSTED peers - only attempts a handshake at
-            // all when BOTH this device's own pairing mode is open
-            // (pairingState.ModeOpen) AND the beacon says the sender's is too
-            // (otherPairingOpen) - two independent, live, local "I'm expecting
-            // to pair right now" signals, not just one side's assumption. Same
-            // tie-breaker as above so both sides don't dial each other
-            // simultaneously; the handshake that results is what actually
-            // surfaces the accept/reject prompt (see HandleNewConnection).
-            else if (pairingState.ModeOpen && otherPairingOpen && !isTrusted
-                && !connectionsByDeviceId.ContainsKey(other_device_id) && other_device_id.CompareTo(identity.GetPublicKey()) < 0
-                && pairingState.PendingPeerId == null)
-            {
-                Console.WriteLine($"Discovered pairing candidate {other_device_id} at {other_port}");
-                await PairByAddress(sender.ToString(), other_port, identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState);
-            }
-
         };
 
         // off-LAN reconnect loop: for trusted peers we have a cached address for
@@ -893,30 +1026,39 @@ class Program
         {
             while (true)
             {
-                var attempts = trustStore.GetTrustedDevicesWithAddress()
-                    .Where(device => !connectionsByDeviceId.ContainsKey(device.PublicKey)
-                        && device.PublicKey.CompareTo(identity.GetPublicKey()) < 0
-                        && connectingTo.TryAdd(device.PublicKey, 0))
-                    .Select(async device =>
-                    {
-                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                        try
+                // Any exception here used to end this loop for good, silently -
+                // after which trusted peers were never redialled off-LAN.
+                try
+                {
+                    var attempts = trustStore.GetTrustedDevicesWithAddress()
+                        .Where(device => !connectionsByDeviceId.ContainsKey(device.PublicKey)
+                            && string.CompareOrdinal(device.PublicKey, identity.GetPublicKey()) < 0
+                            && connectingTo.TryAdd(device.PublicKey, 0))
+                        .Select(async device =>
                         {
-                            await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState, cts.Token);
-                        }
-                        catch (Exception)
-                        {
-                            // not reachable via this address right now — retry next cycle
-                        }
-                        finally
-                        {
-                            connectingTo.TryRemove(device.PublicKey, out _);
-                        }
-                    });
+                            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                            try
+                            {
+                                await ConnectToPeer(device.PublicKey, device.Address!, int.Parse(port), identity, pairingState, passphraseKeyStore, connectionsByDeviceId, clipboardSync, historyAccess, trustStore, fileStore, fileTransferState, cts.Token);
+                            }
+                            catch (Exception)
+                            {
+                                // not reachable via this address right now — retry next cycle
+                            }
+                            finally
+                            {
+                                connectingTo.TryRemove(device.PublicKey, out _);
+                            }
+                        });
 
-                // run every attempt concurrently, so one offline peer's 5s timeout
-                // doesn't delay checking the others
-                await Task.WhenAll(attempts);
+                    // run every attempt concurrently, so one offline peer's 5s timeout
+                    // doesn't delay checking the others
+                    await Task.WhenAll(attempts);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[conn] off-LAN reconnect pass failed, retrying next cycle: {ex.GetType().Name}: {ex.Message}");
+                }
                 await Task.Delay(TimeSpan.FromSeconds(30));
             }
         });

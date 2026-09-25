@@ -1,11 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Two overlapping rounded squares - one clipboard handing off to another -
-     which is the whole product in one shape.
+<!-- Themed-icon (monochrome) layer: two overlapping rounded squares, the
+     same two-card shape as the full-colour icon artwork in
+     mipmap-*/ic_launcher_foreground.png, which can't serve as a monochrome
+     layer itself (the system only uses a layer's alpha, and the artwork is
+     an opaque square).
 
      Everything sits inside the 72x72 safe zone centred in the 108x108 canvas
-     (18dp margin on every side); a launcher mask can clip anything outside it.
-     Drawn in white only, so the same file doubles as the monochrome layer for
-     themed icons. -->
+     (18dp margin on every side); a launcher mask can clip anything outside it. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"

@@ -21,6 +21,7 @@ public class ManageDevicesForm : Form
     {
         this.ipcClient = ipcClient;
         Text = "Manage Devices";
+        Icon = AppIcon.Window;
         Width = 480;
         Height = 400;
         StartPosition = FormStartPosition.CenterScreen;

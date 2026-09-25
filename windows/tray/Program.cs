@@ -54,7 +54,7 @@ class Program
 
         using var trayIcon = new NotifyIcon
         {
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = AppIcon.Tray,
             Visible = true,
             Text = "Clipboard P2P",
             ContextMenuStrip = menu

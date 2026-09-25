@@ -35,6 +35,7 @@ public class PairingForm : Form
         this.ipcClient = ipcClient;
 
         Text = "Pairing";
+        Icon = AppIcon.Window;
         Width = 460;
         Height = 820;
         StartPosition = FormStartPosition.CenterScreen;

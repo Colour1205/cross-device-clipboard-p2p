@@ -323,13 +323,11 @@ class ClipLinkEngine(context: Context) {
      * other don't open two connections at once.
      *
      * Kotlin's String.compareTo is ordinal over UTF-16 code units, matching
-     * the HarmonyOS side's JS comparison exactly. NOTE: the Windows daemon
-     * uses culture-sensitive String.CompareTo, which orders some key pairs
-     * the other way around (ICU sorts 'k' before 'Q'; ordinal doesn't) - when
-     * that happens against a Windows peer, either both sides dial or neither
-     * does. The fix belongs on the C# side (string.CompareOrdinal); do not
-     * "match" it here by going culture-sensitive, that would only break this
-     * against HarmonyOS too.
+     * the HarmonyOS side's JS comparison and the Windows daemon's
+     * string.CompareOrdinal exactly. Keep it ordinal: the daemon used to use
+     * culture-sensitive String.CompareTo, which orders some key pairs the
+     * other way around (ICU sorts 'k' before 'Q'), and against it either both
+     * sides dialled or neither did.
      */
     private fun losesTieBreaker(peerDeviceId: String): Boolean =
         peerDeviceId >= _ownDeviceId.value
@@ -542,8 +540,10 @@ class ClipLinkEngine(context: Context) {
 
     suspend fun setPassphrase(passphrase: String): Boolean = withContext(Dispatchers.Default) {
         if (passphrase.isBlank()) return@withContext false
-        // 210,000 HMAC rounds - never on the main thread.
-        passphraseKeyStore.setPassphrase(passphrase)
+        // 210,000 HMAC rounds - never on the main thread. Trimmed like
+        // HarmonyOS and Windows do, so a stray space on one device can't
+        // silently derive a different key.
+        passphraseKeyStore.setPassphrase(passphrase.trim())
         refreshPassphraseState()
         true
     }

@@ -9,6 +9,12 @@ public class TrustStore
 {
     private Dictionary<string, TrustedDevice> trustedDevices = new Dictionary<string, TrustedDevice>();
     private string truststore_path;
+    // Every connection path (TCP accept, beacon handler, off-LAN reconnect
+    // loop, IPC) reads and writes this from its own thread. Unlocked, two
+    // writes at once collided on the file ("being used by another process"),
+    // and a write during the reconnect loop's enumeration threw
+    // "collection was modified" - each killing whatever loop it hit.
+    private readonly object gate = new();
 
     public TrustStore(string? label = "")
     {
@@ -38,37 +44,47 @@ public class TrustStore
 
     public bool IsTrusted(string key)
     {
-        return trustedDevices.ContainsKey(key);
+        lock (gate) { return trustedDevices.ContainsKey(key); }
     }
 
     public void Trust(string publicKey, string? address = null)
     {
-        trustedDevices[publicKey] = new TrustedDevice(publicKey, address);
-        saveTrustStore();
+        lock (gate)
+        {
+            trustedDevices[publicKey] = new TrustedDevice(publicKey, address);
+            saveTrustStore();
+        }
     }
 
     public void Untrust(string key)
     {
-        trustedDevices.Remove(key);
-        saveTrustStore();
+        lock (gate)
+        {
+            trustedDevices.Remove(key);
+            saveTrustStore();
+        }
     }
 
     // Trusted devices we have a cached off-LAN address for — used by the
     // reconnect loop to reach peers that LAN broadcast discovery can't find.
+    // A snapshot, so callers can enumerate it while other threads write.
     public IEnumerable<TrustedDevice> GetTrustedDevicesWithAddress()
     {
-        return trustedDevices.Values.Where(d => !string.IsNullOrWhiteSpace(d.Address));
+        lock (gate) { return trustedDevices.Values.Where(d => !string.IsNullOrWhiteSpace(d.Address)).ToList(); }
     }
 
     // Every trusted device, address or not — for a "manage devices" UI.
     public IEnumerable<TrustedDevice> GetAllTrustedDevices()
     {
-        return trustedDevices.Values;
+        lock (gate) { return trustedDevices.Values.ToList(); }
     }
 
     public void saveTrustStore()
     {
-        string json = System.Text.Json.JsonSerializer.Serialize(trustedDevices.Values.ToList());
-        File.WriteAllText(truststore_path, json);
+        lock (gate)
+        {
+            string json = System.Text.Json.JsonSerializer.Serialize(trustedDevices.Values.ToList());
+            File.WriteAllText(truststore_path, json);
+        }
     }
 }
